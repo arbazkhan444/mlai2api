@@ -1,0 +1,23 @@
+[package]
+name = "mlai-bridge-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mlai-bridge"
+path = "src/main.rs"
+
+[dependencies]
+mlai-bridge-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tauri = { version = "2", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

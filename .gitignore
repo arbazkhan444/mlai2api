@@ -1,0 +1,25 @@
+# Build output
+target/
+dist/
+bundle/
+
+# Node / Tauri CLI
+node_modules/
+npm-debug.log*
+
+# Runtime data written by the app when it falls back to the working directory
+/requests.jsonl
+/limits.cache.json
+/accounts.json
+/accounts.keys/
+/bodies/
+/.webview/
+/.webview2/
+/.appdata/
+
+# Local verification screenshots
+/*.png
+
+# OS noise
+Thumbs.db
+.DS_Store

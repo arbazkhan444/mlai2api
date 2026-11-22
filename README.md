@@ -1,124 +1,247 @@
-# MLAI Bridge (desktop)
+# mlai2api
 
-Rust + Tauri control panel for the local OpenAI-compatible bridge to ML AI Code.
-The proxy, run-token pool, model aliases, SSE normalization and request history live in
-`crates/core`; the Tauri shell only edits config and drives the proxy lifecycle.
+A local, OpenAI-compatible bridge to **ML AI Code**. Point Cline, Roo Code, opencode or any
+OpenAI-compatible client at it, and it relays each request through the ML AI Code cloud gateway
+using your own account — with model aliases, multiple accounts, token/cache accounting, and a
+desktop control panel.
+
+> Unofficial community tool. Not affiliated with, endorsed by, or supported by ML AI Code.
+
+---
+
+## How it works
+
+ML AI Code authorises a "run" per model by minting a short-lived run token instead of handing out a
+long-lived API key. This bridge does that minting for you:
+
+1. You add an ML AI Code account (device token) once.
+2. On the first request for a model, the bridge calls `POST /api/laptop` with action `start` and keeps the
+   run token (re-minting shortly before it expires).
+3. It forwards the request to `https://code.ml.ai/api/model/v1/chat/completions` and streams the response
+   back unchanged in OpenAI format.
+
+The upstream already speaks OpenAI SSE, so the proxy mainly normalises model names, guarantees a usage
+chunk, tracks tokens/cache, and keeps a local record of every request.
+
+---
+
+## Features
+
+- **OpenAI-compatible** `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/health`, `/usage`.
+- **Model aliases** — expose your own names (`opus`, `glm`, `forge`, …) and map them to upstream models.
+- **Multiple accounts** — add several ML AI Code accounts, switch the active one, per-request attribution.
+  Tokens are encrypted with **Windows DPAPI**, never stored in plaintext.
+- **Usage tracking** — input/output/cached/reasoning tokens, cache hit rate, credits per model and per account.
+- **Request inspector** — per-request drawer with the full request/response bodies, timings (duration, first-token),
+  reasoning effort, and copy-as-JSON. Bodies are persisted to disk with a bounded, self-pruning store.
+- **Desktop panel** (Tauri) with Proxy / Usage / Accounts tabs, plus a headless `serve` mode.
+- **Self-testing** — a black-box HTTP suite (`test-rust.mjs`) covering the whole proxy surface.
+
+---
+
+## Requirements
+
+| need | why |
+| --- | --- |
+| Windows 10/11 x64 | the app and DPAPI account storage are Windows-first |
+| WebView2 runtime | bundled in Windows 11; the installer can fetch it on Windows 10 |
+| Rust (MSVC toolchain) + VS 2022 Build Tools (C++) | building from source |
+| Node.js 18+ | only for the Tauri CLI used by `bundle.cmd` |
+| An ML AI Code account | sign in with the `mlai` CLI, or paste a device token |
+
+Run `rustup show` — the default toolchain must be the **MSVC** one (`stable-x86_64-pc-windows-msvc`),
+not the standalone GNU toolchain. All build scripts load `vcvars64.bat` for you.
+
+---
 
 ## Build
 
-The machine's PATH points at a standalone gnullvm Rust, so builds go through `build.cmd`,
-which loads the VS 2022 BuildTools environment and uses rustup's MSVC toolchain:
+### Debug build (fast loop)
 
+```bat
+build.cmd build
 ```
-build.cmd build -p mlai-bridge-app      # debug exe: target/debug/mlai-bridge.exe
-build.cmd build -p mlai-bridge-app --release
+
+`build.cmd` loads the Visual Studio environment, points `TEMP` at `%LOCALAPPDATA%\Temp`, and forwards
+everything to `cargo`, so `build.cmd test`, `build.cmd run`, etc. also work.
+
+Output: `target\debug\mlai-bridge.exe`.
+
+### Release build + installer
+
+```bat
+npm install --save-dev @tauri-apps/cli@^2   :: once
+bundle.cmd
 ```
+
+`bundle.cmd` runs `npx tauri build --ci` with the MSVC environment and produces:
+
+- `target\release\mlai-bridge.exe` — the app
+- `target\release\bundle\nsis\MLAI Bridge_<version>_x64-setup.exe` — per-user installer (no admin required)
+
+### Tests
+
+```bat
+build.cmd test -p mlai-bridge-core        :: unit tests (account store, DPAPI roundtrip)
+build.cmd build -p mlai-bridge-app
+.\target\debug\mlai-bridge.exe serve --port 8790
+node test-rust.mjs                       :: set BRIDGE_PORT=8790 for a non-default port
+```
+
+`test-rust.mjs` exercises auth, model listing, streaming SSE framing, tool calls, usage accounting and cache hits.
+
+---
 
 ## Run
 
+### Desktop panel (default)
+
+```bat
+mlai-bridge.exe
 ```
-target/debug/mlai-bridge.exe            # opens the control panel, proxy is started from the UI
-target/debug/mlai-bridge.exe init       # write ~/.mlai-bridge/config.json (key + project id)
-target/debug/mlai-bridge.exe doctor     # sign-in, project and catalog check
-target/debug/mlai-bridge.exe serve      # headless proxy for scripts / CI
+
+The panel opens on the **Proxy** tab and starts the proxy automatically when a project is configured.
+Use **Start / Stop** to control it, and copy the base URL + bridge key into your client.
+
+### Headless proxy
+
+```bat
+mlai-bridge.exe serve --port 8787
 ```
 
-Credentials are the ones the `mlai` CLI already stored in `~/.mlai` (or `MLAI_TOKEN`).
+Prints the account in use and listens on `http://127.0.0.1:8787/v1`.
 
-## What the panel does
+### First-time setup
 
-- Start/stop the proxy and copy the base URL + bridge key.
-- Edit host, port, server, project, folder, run task, default model, reasoning effort.
-- List model aliases with the real context window and output reserve (Read limits mints one run per model).
-- Live request log with status, latency and token counts, persisted in `~/.mlai-bridge/history.redb`.
-
-## Layout
-
+```bat
+mlai-bridge.exe init            :: writes config.json with a new bridge key and discovered project
+mlai-bridge.exe doctor          :: checks sign-in, config and project
+mlai-bridge.exe self-test       :: drives the GUI's command path without opening a window
 ```
-crates/core/src/config.rs   config.json (same field names as the Node bridge)
-crates/core/src/auth.rs     ~/.mlai device credential
-crates/core/src/mlai.rs     control plane + run-token pool (one token per model)
-crates/core/src/transform.rs model aliases + OpenAI wire normalization
-crates/core/src/server.rs   axum routes, SSE passthrough
-crates/core/src/store.rs    redb history store
-crates/app/src/gui.rs       Tauri commands
-ui/                         static panel (no build step)
-```
-## Tabs and usage
 
-The panel has two tabs: **Proxy** (connection, config, model limits) and **Usage** (token accounting).
-Usage is recorded per request in `requests.jsonl` and aggregated per model alias.
+Config resolution order: `--config <path>` → `%LOCALAPPDATA%\mlai-bridge\config.json` → `./config.json`.
 
-| field | source |
+---
+
+## Connect a client
+
+In Cline / Roo Code choose provider **OpenAI Compatible** and fill in:
+
+| field | value |
 | --- | --- |
-| input | `usage.prompt_tokens` |
-| output | `usage.completion_tokens` (includes reasoning tokens) |
-| cached input | `usage.prompt_tokens_details.cached_tokens` |
-| reasoning | `usage.completion_tokens_details.reasoning_tokens` |
-| spend | `total_tokens / 1_000_000` credits |
+| Base URL | `http://127.0.0.1:8787/v1` |
+| API key | the `apiKey` from `config.json` (also shown on the Proxy tab) |
+| Model | any alias from `/v1/models` (`opus`, `sonnet`, `gpt-6`, `glm`, `kimi`, `grok`, `forge`, `mlai-code`) |
 
-**Caching is real and reported**, but only by some models: `pixis`/`pixis-opus` return
-`prompt_tokens_details.cached_tokens` (a repeated ~1.8k-token prompt reported 1812 cached of 1813
-prompt tokens), while `glm-5.3` returns totals only. The Usage tab shows cached input, a per-model
-hit rate, and treats missing details as unknown rather than zero.
+For opencode use `@ai-sdk/openai-compatible` with `baseURL` set to the same URL and `limit.context` matching
+the model (the panel shows real context windows once limits have been learned).
 
-Spend uses ML AI Code's own unit: **1 credit = 1,000,000 tokens** (`TOKENS_PER_CREDIT` in the app's
-`tui/chat.mjs`). The API exposes no per-model USD price, so credit totals are derived from tokens.
+> **Reasoning tokens count against `max_tokens`.** A small `max_tokens` with high reasoning can produce an empty
+> answer. The default `reasoningEffort` is `low` for that reason — raise it per request if you need deeper thinking.
 
-`GET /usage` on the proxy returns the same aggregate as JSON for scripts.
-## Request bodies and the detail drawer
+---
 
-Every proxied call stores the exact upstream request body and the response body, plus timings,
-so the Usage tab can show a per-request drawer that survives restarts:
+## Accounts
 
-- metadata row in `requests.jsonl` (`effort`, `firstTokenMs`, `hasBody`, token breakdown)
-- bodies in `<history dir>/bodies/<id>.json` as `{ request, response }`
+Open the **Accounts** tab:
 
-For streamed calls the response is the assembled completion (`content`, `reasoning`, `toolCalls`,
-`finishReason`, `usage`, `chunks`) plus the raw SSE up to 512 KB; JSON responses are stored as-is.
-A single body is capped at 8 MB and replaced by a preview beyond that.
+- **Import from mlai CLI** — reuses the account already signed in by `mlai login` on this machine.
+- **Add account** — paste a device token (`mlaid_...`). It is validated with `whoami` and labelled with the
+  account name.
+- **Use** — makes an account active and restarts the proxy with its credential.
+- **Remove** — deletes the account and its stored token.
 
-**Disk usage is bounded.** Two settings in `config.json` control it:
+Account metadata lives in `accounts.json`; each token is encrypted with **Windows DPAPI** into
+`accounts.keys\<id>.bin`, so only a `mlaid_…abcd` hint is stored in plaintext. The Usage tab shows the
+active account and can filter requests by account; every request row records the account that sent it.
+
+---
+
+## Usage and spend
+
+The **Usage** tab shows totals and per-model breakdowns: input, output, cached input, reasoning, cache-hit rate and
+credits. ML AI Code's unit is **1 credit = 1,000,000 tokens**, so spend is derived as `total_tokens / 1e6`
+(the API does not publish per-model prices).
+
+Clicking a row opens a drawer with timestamp, duration, first-token latency, effort, token counts, and the full
+request/response bodies. Bodies live in `bodies/<id>.json` and are capped:
+
+| setting | default | meaning |
+| --- | --- | --- |
+| `bodyKeep` | 200 | keep at most this many body files (oldest pruned first) |
+| `bodyMaxBytes` | 67108864 | also prune oldest until the bodies folder fits 64 MB |
+
+Old metadata rows are kept even after their bodies are pruned; the drawer says so instead of inventing data.
+Rows written before account attribution existed are shown as **Unattributed**.
+
+---
+
+## Configuration reference
+
+`config.json` (camelCase):
 
 | key | default | meaning |
 | --- | --- | --- |
-| `bodyKeep` | 200 | keep at most this many body files, oldest pruned first |
-| `bodyMaxBytes` | 67108864 (64 MB) | also prune oldest until the bodies folder fits |
+| `host` | `127.0.0.1` | bind address; keep localhost unless you know why |
+| `port` | `8787` | proxy port |
+| `server` | `https://code.ml.ai` | ML AI Code control plane |
+| `apiKey` | generated | bridge key clients must send as `Authorization: Bearer …` |
+| `project` / `folder` | discovered | run context sent when minting a run token |
+| `runTask` | `Local model bridge session` | task title on the run card |
+| `defaultModel` | `mlai-code` | model used when a client omits `model` |
+| `aliases` | see above | client model name → upstream model id |
+| `reasoning` | `native` | how to surface reasoning: `native` / `reasoning` / `both` / `none` |
+| `reasoningEffort` | `low` | sent upstream when the client does not specify one |
+| `tokenSafetyMs` | `300000` | re-mint run tokens this long before expiry |
+| `requestTimeoutMs` | `900000` | upstream timeout |
+| `historyPath` | auto | `requests.jsonl` metadata log |
+| `limitsCache` | auto | learned context/output limits |
+| `accountsPath` | auto | `accounts.json` |
 
-Pruning runs at startup and after every write; metadata rows are kept separately (last 5000 in
-memory, rotated on disk), so history still lists requests whose bodies were pruned — the drawer
-says the body is no longer available instead of inventing one.
+Data location: `%LOCALAPPDATA%\mlai-bridge` when writable, otherwise the working directory
+(config, accounts, `requests.jsonl`, `bodies/`, limits cache).
 
-The table also filters by model and effort, and each row shows input/output/cached/reasoning tokens.
-## Accounts
+### HTTP endpoints
 
-The Accounts tab manages several ML AI Code accounts (device tokens). Metadata lives in
-`accounts.json`; each token is encrypted with **Windows DPAPI** into `accounts.keys/<id>.bin`,
-so the token is never stored in plaintext (the config only holds the bridge key). Only a
-`mlaid_…abcd` hint is kept for display.
+| endpoint | purpose |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI-compatible chat (alias `/chat/completions`) |
+| `GET /v1/models` | alias list with learned `context_length` / `max_completion_tokens` |
+| `GET /usage` | aggregate usage JSON (stats, per model, per account) |
+| `GET /health` | status, run pool, limits known, version |
 
-- **Add account** validates the pasted token with `whoami` and uses the returned name as the label.
-- **Import from mlai CLI** reuses the account already signed in on this machine.
-- **Use** makes an account active and restarts the proxy with its credential.
-- Requests are signed with the active account and every row records `accountId` / `accountLabel`.
-- Rows written before attribution existed deserialize as **Unattributed** (serde defaults), so old
-  history keeps working and can be filtered rather than disappearing.
+---
 
-The Usage tab shows the active account and can filter requests by account, model or effort.
-## Build a release installer
+## Project layout
 
 ```
-npm install                # pulls @tauri-apps/cli
-bundle.cmd                 # release build + NSIS installer
+crates/core/      proxy engine: config, auth, accounts (DPAPI), mlai client/run pool,
+                  request rewriting + SSE normalisation, storage
+crates/app/       Tauri desktop panel + CLI entry point
+ui/               static panel (no build step): index.html, app.js, styles.css
+test-rust.mjs     black-box HTTP suite
+build.cmd         cargo wrapper with the MSVC environment
+bundle.cmd        release build + NSIS installer
 ```
 
-`bundle.cmd` loads the MSVC environment (vcvars64) and runs `npx tauri build --ci`.
-Outputs:
+---
 
-- `target\release\mlai-bridge.exe` — the app
-- `target\release\bundle\nsis\MLAI Bridge_<version>_x64-setup.exe` — the installer
+## Troubleshooting
 
-The installer is per-machine and bundles the WebView2 bootstrapper. It installs
-`MLAI Bridge.exe` plus an uninstaller; settings, accounts, history and request bodies live in
-`%LOCALAPPDATA%\mlai-bridge\` (config, accounts, requests.jsonl, bodies/) when writable, and fall
-back to the working directory otherwise.
+- **`401 invalid_api_key`** — the client is sending the wrong bridge key; copy it from the Proxy tab.
+- **`404 model_not_found`** — the alias does not exist and raw model ids are disabled; check `/v1/models`.
+- **Empty answers** — reasoning consumed `max_tokens`; lower effort or raise the limit.
+- **`No active account`** — add one on the Accounts tab, or run `mlai login` and import it.
+- **Linker error about `x86_64-w64-mingw32-clang`** — you are invoking `cargo` directly instead of `build.cmd`
+  (wrong toolchain on PATH).
+- **WebView2 "Access is denied" on launch** — the app creates its profile in a writable directory; ensure
+  `%LOCALAPPDATA%` is writable for your user, or run from a writable folder.
+- **Port already in use** — stop the other instance or run `serve --port <n>`.
+
+---
+
+## Disclaimer
+
+This project talks to ML AI Code's private endpoints on your behalf, using your own account and plan.
+Use it only with an account you are authorised to use, and respect the provider's terms of service.
+The protocol may change without notice.

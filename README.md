@@ -240,6 +240,12 @@ bundle.cmd        release build + NSIS installer
 
 ---
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Copyright (c) 2026 Arbaz Khan.
+
 ## Disclaimer
 
 This project talks to ML AI Code's private endpoints on your behalf, using your own account and plan.

@@ -207,6 +207,10 @@ pub struct RunPool {
     limits: Mutex<BTreeMap<String, Limits>>,
     /// Weighted units spent on the run currently cached for each model, since it was minted.
     consumed: StdMutex<HashMap<String, i64>>,
+    /// Successful model calls on that run, reported on finish with the units.
+    calls: StdMutex<HashMap<String, i64>>,
+    /// Refusals and typed errors per model and code, for /usage.
+    rejections: StdMutex<BTreeMap<String, BTreeMap<String, i64>>>,
 }
 
 fn now_ms() -> i64 {
@@ -270,6 +274,8 @@ impl RunPool {
             mint_lock: Mutex::new(()),
             limits: Mutex::new(limits),
             consumed: StdMutex::new(HashMap::new()),
+            calls: StdMutex::new(HashMap::new()),
+            rejections: StdMutex::new(BTreeMap::new()),
         }
     }
 
@@ -291,9 +297,40 @@ impl RunPool {
             .unwrap_or(0)
     }
 
+    pub fn calls_of(&self, model: &str) -> i64 {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(model)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Weighted units and successful calls for the run currently cached for this model.
+    pub fn spend(&self, model: &str) -> (i64, i64) {
+        (self.consumed_of(model), self.calls_of(model))
+    }
+
+    fn reset_spend(&self, model: &str) {
+        self.consumed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(model);
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(model);
+    }
+
     /// Records what a response cost, so the next call can replace the run before
     /// the gateway refuses it. Safe to call from sync code (the history writer).
     pub fn note_usage(&self, model: &str, units: i64) {
+        *self
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(model.to_string())
+            .or_insert(0) += 1;
         if units <= 0 {
             return;
         }
@@ -302,6 +339,27 @@ impl RunPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *consumed.entry(model.to_string()).or_insert(0) += units;
+    }
+
+    /// Counts a refusal or typed error so /usage can show why a model was failing.
+    pub fn note_rejection(&self, model: &str, code: &str) {
+        let mut map = self
+            .rejections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = map
+            .entry(model.to_string())
+            .or_default()
+            .entry(code.to_string())
+            .or_insert(0);
+        *count += 1;
+    }
+
+    pub fn rejections(&self) -> BTreeMap<String, BTreeMap<String, i64>> {
+        self.rejections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// The cached run, while it has not expired and still has budget left.
@@ -323,6 +381,7 @@ impl RunPool {
         if let Some(hit) = self.reusable(model).await {
             return Ok(hit);
         }
+        let (spent, calls) = self.spend(model);
         let started = now_ms();
         let data = self
             .client
@@ -350,15 +409,13 @@ impl RunPool {
         };
         let old = self.cache.lock().await.insert(model.to_string(), entry.clone());
         // A fresh run starts with its whole budget again.
-        self.consumed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(model.to_string(), 0);
+        self.reset_spend(model);
         if let Some(old) = old {
             if old.token != entry.token {
                 let client = self.client.clone();
+                let usage = json!({"tokens": spent, "calls": calls});
                 tokio::spawn(async move {
-                    let _ = client.finish_run(&old.token, "completed", json!({})).await;
+                    let _ = client.finish_run(&old.token, "completed", usage).await;
                 });
             }
         }
@@ -390,14 +447,13 @@ impl RunPool {
     }
 
     pub async fn invalidate(&self, model: &str) {
-        self.consumed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(model);
+        let (spent, calls) = self.spend(model);
+        self.reset_spend(model);
         if let Some(old) = self.cache.lock().await.remove(model) {
             let client = self.client.clone();
+            let usage = json!({"tokens": spent, "calls": calls});
             tokio::spawn(async move {
-                let _ = client.finish_run(&old.token, "completed", json!({})).await;
+                let _ = client.finish_run(&old.token, "completed", usage).await;
             });
         }
     }
@@ -410,9 +466,11 @@ impl RunPool {
             values
         };
         for entry in entries {
+            let (spent, calls) = self.spend(&entry.model);
+            let usage = json!({"tokens": spent, "calls": calls});
             let _ = self
                 .client
-                .finish_run(&entry.token, "completed", json!({}))
+                .finish_run(&entry.token, "completed", usage)
                 .await;
         }
     }
@@ -425,7 +483,7 @@ impl RunPool {
             .map(|t| {
                 json!({
                     "model": t.model, "runId": t.run_id, "expires": t.expires, "budget": t.budget,
-                    "consumed": self.consumed_of(&t.model)
+                    "consumed": self.consumed_of(&t.model), "calls": self.calls_of(&t.model)
                 })
             })
             .collect()
@@ -497,5 +555,28 @@ mod tests {
         let entry = run(Some(1_000_000));
         assert!(!needs_refresh(&entry, 899_999));
         assert!(needs_refresh(&entry, 900_000));
+    }
+
+    #[tokio::test]
+    async fn spend_and_calls_reset_when_a_run_is_dropped() {
+        let client = Arc::new(MlaiClient::new("http://127.0.0.1:9", "test"));
+        let pool = RunPool::new(client, &Config::default());
+        pool.note_usage("m", 100);
+        pool.note_usage("m", 50);
+        assert_eq!(pool.spend("m"), (150, 2));
+        pool.invalidate("m").await;
+        assert_eq!(pool.spend("m"), (0, 0));
+    }
+
+    #[test]
+    fn rejections_are_counted_per_model_and_code() {
+        let client = Arc::new(MlaiClient::new("http://127.0.0.1:9", "test"));
+        let pool = RunPool::new(client, &Config::default());
+        pool.note_rejection("glm-5.3", "billing_limit");
+        pool.note_rejection("glm-5.3", "billing_limit");
+        pool.note_rejection("pixis-opus", "context_overflow");
+        let counts = pool.rejections();
+        assert_eq!(counts["glm-5.3"]["billing_limit"], 2);
+        assert_eq!(counts["pixis-opus"]["context_overflow"], 1);
     }
 }

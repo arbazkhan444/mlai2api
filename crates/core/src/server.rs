@@ -225,6 +225,10 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
         Err(message) => return json_response(StatusCode::NOT_FOUND, error_payload(404, &message, "model_not_found")),
     };
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let want_usage = body
+        .pointer("/stream_options/include_usage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let limits = state.pool.limits_for(&resolved.real).await;
     let capability = crate::capability::Capability::resolve(&resolved.real, limits.as_ref(), &state.config);
     let upstream_body = rewrite_request(&body, &state.config, &resolved.real, &capability);
@@ -262,11 +266,16 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
             }
         };
         let status = resp.status();
-        if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::PAYMENT_REQUIRED {
+        if status != reqwest::StatusCode::UNAUTHORIZED
+            && status != reqwest::StatusCode::PAYMENT_REQUIRED
+            && status != reqwest::StatusCode::CONFLICT
+        {
             break;
         }
         let text = resp.text().await.unwrap_or_default();
-        let run_refused = text.contains("run_token_invalid") || text.contains("billing_limit");
+        let run_refused = text.contains("run_token_invalid")
+            || text.contains("billing_limit")
+            || text.contains("run_finished");
         if run_refused && !replayed {
             replayed = true;
             state.pool.invalidate(&resolved.real).await;
@@ -305,7 +314,7 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
 
     let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     if stream && content_type.contains("text/event-stream") {
-        return stream_out(state, resp, resolved, started, upstream_body, effort);
+        return stream_out(state, resp, resolved, started, upstream_body, effort, want_usage);
     }
 
     let value: Value = match resp.json::<Value>().await {
@@ -360,12 +369,14 @@ fn stream_out(
     started: std::time::Instant,
     request_body: Value,
     effort: Option<String>,
+    want_usage: bool,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let alias = resolved.alias.clone();
     let real = resolved.real.clone();
     tokio::spawn(async move {
         let mut ctx = StreamCtx::new(&alias, state.config.reasoning);
+        ctx.want_usage = want_usage;
         let mut buffer = String::new();
         let mut upstream = resp.bytes_stream();
         let mut failed: Option<String> = None;
@@ -392,7 +403,7 @@ fn stream_out(
                                 continue;
                             }
                             let Ok(value) = serde_json::from_str::<Value>(payload) else { continue };
-                            let out = normalize_chunk(&value, &mut ctx);
+                            let Some(out) = normalize_chunk(&value, &mut ctx) else { continue };
                             if let Some(choices) = out.get("choices").and_then(|c| c.as_array()) {
                                 for choice in choices {
                                     if let Some(delta) = choice.get("delta") {

@@ -46,7 +46,7 @@ chunk, tracks tokens/cache, and keeps a local record of every request.
 | Windows 10/11 x64 | the app and DPAPI account storage are Windows-first |
 | WebView2 runtime | bundled in Windows 11; the installer can fetch it on Windows 10 |
 | Rust (MSVC toolchain) + VS 2022 Build Tools (C++) | building from source |
-| Node.js 18+ | only for the Tauri CLI used by `bundle.cmd` |
+| Node.js 18+ | building the React UI in `ui/` and running the Tauri CLI |
 | An ML AI Code account | sign in with the `mlai` CLI, or paste a device token |
 
 Run `rustup show` — the default toolchain must be the **MSVC** one (`stable-x86_64-pc-windows-msvc`),
@@ -55,6 +55,15 @@ not the standalone GNU toolchain. All build scripts load `vcvars64.bat` for you.
 ---
 
 ## Build
+
+### UI (once, and after UI changes)
+
+```bat
+cd ui && npm install && npm run build
+```
+
+The desktop UI is a Vite + React + TypeScript app in `ui/`; Tauri embeds `ui\dist`, so it must exist
+before any cargo build. `npm run dev` (port 1420) serves it in a plain browser with sample data.
 
 ### Debug build (fast loop)
 
@@ -65,16 +74,18 @@ build.cmd build
 `build.cmd` loads the Visual Studio environment, points `TEMP` at `%LOCALAPPDATA%\Temp`, and forwards
 everything to `cargo`, so `build.cmd test`, `build.cmd run`, etc. also work.
 
-Output: `target\debug\mlai-bridge.exe`.
+Output: `target\debug\mlai-bridge.exe`. A plain debug build loads the UI from the dev server
+(`http://localhost:1420`), so run `npm run dev` in `ui/` alongside it, or use `ui\node_modules\.bin\tauri dev`
+from the repo root, which starts both.
 
 ### Release build + installer
 
 ```bat
-npm install --save-dev @tauri-apps/cli@^2   :: once
 bundle.cmd
 ```
 
-`bundle.cmd` runs `npx tauri build --ci` with the MSVC environment and produces:
+`bundle.cmd` runs `npx tauri build --ci` with the MSVC environment; Tauri runs `npm run build` in `ui/`
+first, then produces:
 
 - `target\release\mlai-bridge.exe` — the app
 - `target\release\bundle\nsis\MLAI Bridge_<version>_x64-setup.exe` — per-user installer (no admin required)

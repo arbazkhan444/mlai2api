@@ -13,6 +13,16 @@ pub struct Account {
     pub created_at: String,
     #[serde(default)]
     pub last_used: Option<String>,
+    /// Device-token expiry in ms since the epoch, when the source knew it (mlai CLI import).
+    #[serde(default)]
+    pub expires: Option<i64>,
+    /// Result of the last whoami check, so health survives an app restart.
+    #[serde(default)]
+    pub last_check_at: Option<String>,
+    #[serde(default)]
+    pub last_check_ok: Option<bool>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -88,6 +98,11 @@ impl Accounts {
 
     /// Adds an account and stores its token encrypted; returns the account.
     pub fn add(&self, label: &str, server: &str, token: &str) -> Result<Account> {
+        self.add_full(label, server, token, None)
+    }
+
+    /// Like `add`, but remembers a token expiry when the caller knows it.
+    pub fn add_full(&self, label: &str, server: &str, token: &str, expires: Option<i64>) -> Result<Account> {
         if token.trim().is_empty() {
             return Err(anyhow!("token is empty"));
         }
@@ -102,6 +117,10 @@ impl Accounts {
             token_hint: hint_for(token),
             created_at: chrono::Utc::now().to_rfc3339(),
             last_used: None,
+            expires,
+            last_check_at: None,
+            last_check_ok: None,
+            last_error: None,
         };
         file.accounts.push(account.clone());
         if file.active.is_none() {
@@ -109,6 +128,18 @@ impl Accounts {
         }
         self.save(&file)?;
         Ok(account)
+    }
+
+    /// Store the outcome of a whoami check so the Accounts page can show health after a restart.
+    pub fn record_check(&self, id: &str, ok: bool, error: Option<String>) -> Result<()> {
+        let mut file = self.file();
+        let Some(account) = file.accounts.iter_mut().find(|a| a.id == id) else {
+            return Err(anyhow!("no such account"));
+        };
+        account.last_check_at = Some(chrono::Utc::now().to_rfc3339());
+        account.last_check_ok = Some(ok);
+        account.last_error = error;
+        self.save(&file)
     }
 
     pub fn activate(&self, id: &str) -> Result<()> {
@@ -147,7 +178,7 @@ impl Accounts {
                 server: account.server.clone(),
                 store: "account".into(),
                 label: Some(account.label.clone()),
-                expires: None,
+                expires: account.expires,
             },
             account.id.clone(),
             account.label.clone(),

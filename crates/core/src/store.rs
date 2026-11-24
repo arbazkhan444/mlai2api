@@ -145,6 +145,62 @@ impl Stats {
     }
 }
 
+fn model_usage_of<'a>(rows: impl Iterator<Item = &'a RequestRow>) -> Vec<ModelUsage> {
+    let mut out: Vec<ModelUsage> = Vec::new();
+    for row in rows {
+        let entry = match out.iter_mut().find(|m| m.model == row.model) {
+            Some(entry) => entry,
+            None => {
+                out.push(ModelUsage { model: row.model.clone(), real_model: row.real_model.clone(), ..Default::default() });
+                out.last_mut().unwrap()
+            }
+        };
+        entry.requests += 1;
+        let prompt = row.prompt_tokens.unwrap_or(0);
+        let completion = row.completion_tokens.unwrap_or(0);
+        let cached = row.cached_tokens.unwrap_or(0);
+        entry.prompt_tokens += prompt;
+        entry.completion_tokens += completion;
+        entry.cached_tokens += cached;
+        entry.reasoning_tokens += row.reasoning_tokens.unwrap_or(0);
+        entry.total_tokens += row.total_tokens.unwrap_or(prompt + completion);
+        if cached > 0 {
+            entry.cache_hits += 1;
+        }
+    }
+    for entry in out.iter_mut() {
+        entry.credits = credits_of(entry.total_tokens);
+    }
+    out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    out
+}
+
+fn account_usage_of<'a>(rows: impl Iterator<Item = &'a RequestRow>) -> Vec<AccountUsage> {
+    let mut out: Vec<AccountUsage> = Vec::new();
+    for row in rows {
+        let entry = match out.iter_mut().find(|a| a.account_id == row.account_id) {
+            Some(entry) => entry,
+            None => {
+                out.push(AccountUsage {
+                    account_id: row.account_id.clone(),
+                    account_label: row.account_label.clone(),
+                    ..Default::default()
+                });
+                out.last_mut().unwrap()
+            }
+        };
+        entry.requests += 1;
+        entry.total_tokens += row
+            .total_tokens
+            .unwrap_or_else(|| row.prompt_tokens.unwrap_or(0) + row.completion_tokens.unwrap_or(0));
+    }
+    for entry in out.iter_mut() {
+        entry.credits = credits_of(entry.total_tokens);
+    }
+    out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    out
+}
+
 struct Inner {
     rows: Vec<RequestRow>,
     next_id: i64,
@@ -326,60 +382,59 @@ impl Store {
 
     pub fn by_model(&self) -> Result<Vec<ModelUsage>> {
         let inner = self.inner.lock().unwrap();
-        let mut out: Vec<ModelUsage> = Vec::new();
-        for row in inner.rows.iter() {
-            let entry = match out.iter_mut().find(|m| m.model == row.model) {
-                Some(entry) => entry,
-                None => {
-                    out.push(ModelUsage { model: row.model.clone(), real_model: row.real_model.clone(), ..Default::default() });
-                    out.last_mut().unwrap()
-                }
-            };
-            entry.requests += 1;
-            let prompt = row.prompt_tokens.unwrap_or(0);
-            let completion = row.completion_tokens.unwrap_or(0);
-            let cached = row.cached_tokens.unwrap_or(0);
-            entry.prompt_tokens += prompt;
-            entry.completion_tokens += completion;
-            entry.cached_tokens += cached;
-            entry.reasoning_tokens += row.reasoning_tokens.unwrap_or(0);
-            entry.total_tokens += row.total_tokens.unwrap_or(prompt + completion);
-            if cached > 0 {
-                entry.cache_hits += 1;
-            }
-        }
-        for entry in out.iter_mut() {
-            entry.credits = credits_of(entry.total_tokens);
-        }
-        out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
-        Ok(out)
+        Ok(model_usage_of(inner.rows.iter()))
     }
 
     pub fn by_account(&self) -> Result<Vec<AccountUsage>> {
         let inner = self.inner.lock().unwrap();
-        let mut out: Vec<AccountUsage> = Vec::new();
-        for row in inner.rows.iter() {
-            let entry = match out.iter_mut().find(|a| a.account_id == row.account_id) {
-                Some(entry) => entry,
-                None => {
-                    out.push(AccountUsage {
-                        account_id: row.account_id.clone(),
-                        account_label: row.account_label.clone(),
-                        ..Default::default()
-                    });
-                    out.last_mut().unwrap()
-                }
-            };
-            entry.requests += 1;
-            entry.total_tokens += row
-                .total_tokens
-                .unwrap_or_else(|| row.prompt_tokens.unwrap_or(0) + row.completion_tokens.unwrap_or(0));
+        Ok(account_usage_of(inner.rows.iter()))
+    }
+
+    /// Usage over one time window, with `buckets` equal slices for a chart.
+    pub fn window(&self, from_ms: i64, to_ms: i64, buckets: i64) -> Result<Value> {
+        let inner = self.inner.lock().unwrap();
+        let from = from_ms;
+        let to = to_ms.max(from_ms + 1);
+        let rows: Vec<&RequestRow> = inner
+            .rows
+            .iter()
+            .filter(|row| {
+                chrono::DateTime::parse_from_rfc3339(&row.ts)
+                    .map(|ts| {
+                        let ms = ts.timestamp_millis();
+                        ms >= from && ms <= to
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut stats = Stats::default();
+        for row in rows.iter() {
+            stats.add(row);
         }
-        for entry in out.iter_mut() {
-            entry.credits = credits_of(entry.total_tokens);
+        stats.finish();
+        let count = buckets.clamp(1, 240) as usize;
+        let span = (to - from) as f64;
+        let mut slots: Vec<(i64, i64, i64)> = (0..count)
+            .map(|i| (from + (span * i as f64 / count as f64) as i64, 0, 0))
+            .collect();
+        for row in rows.iter() {
+            let ms = chrono::DateTime::parse_from_rfc3339(&row.ts).map(|ts| ts.timestamp_millis()).unwrap_or(from);
+            let mut index = ((ms - from) as f64 / span * count as f64).floor() as i64;
+            index = index.clamp(0, count as i64 - 1);
+            let slot = &mut slots[index as usize];
+            slot.1 += 1;
+            slot.2 += row.total_tokens.unwrap_or_else(|| row.prompt_tokens.unwrap_or(0) + row.completion_tokens.unwrap_or(0));
         }
-        out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
-        Ok(out)
+        Ok(json!({
+            "from": from,
+            "to": to,
+            "stats": stats,
+            "byModel": model_usage_of(rows.iter().copied()),
+            "byAccount": account_usage_of(rows.iter().copied()),
+            "buckets": slots.iter().map(|(start, requests, tokens)| json!({
+                "start": start, "requests": requests, "tokens": tokens
+            })).collect::<Vec<_>>(),
+        }))
     }
 
     pub fn clear(&self) -> Result<()> {

@@ -605,6 +605,8 @@ async fn health(state: State<'_, Arc<GuiState>>) -> Result<Value, String> {
 
 fn writable_data_dir() -> PathBuf {
     let candidates = [
+        // Lets a second instance (or a test run) use its own WebView2 data folder.
+        std::env::var_os("MLAI_BRIDGE_WEBVIEW_DIR").map(PathBuf::from),
         std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("mlai-bridge").join("webview")),
         Some(mlai_bridge_core::config::home_dir().join("webview")),
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(".webview"))),
@@ -709,15 +711,26 @@ pub fn run(config_path: PathBuf) -> anyhow::Result<()> {
 
             let data_dir = writable_data_dir();
             tracing::info!("webview data dir: {}", data_dir.display());
-            let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
-                .title("MLAI Bridge")
-                .inner_size(1120.0, 760.0)
-                .min_inner_size(900.0, 600.0)
-                .center()
-                .data_directory(data_dir)
-                .background_color(tauri::window::Color(24, 24, 27, 255))
-                .visible(!hidden_on_launch)
-                .build()?;
+            // Another instance running at a different privilege level can lock the shared
+            // WebView2 folder ("resource is in use"); fall back to a private folder instead of dying.
+            let build_window = |dir: PathBuf| {
+                tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                    .title("MLAI Bridge")
+                    .inner_size(1120.0, 760.0)
+                    .min_inner_size(900.0, 600.0)
+                    .center()
+                    .data_directory(dir)
+                    .background_color(tauri::window::Color(24, 24, 27, 255))
+                    .visible(!hidden_on_launch)
+                    .build()
+            };
+            let window = match build_window(data_dir.clone()) {
+                Ok(window) => window,
+                Err(error) => {
+                    tracing::warn!("webview data dir {} is locked ({}); using a private one", data_dir.display(), error);
+                    build_window(data_dir.with_file_name("webview-private"))?
+                }
+            };
             {
                 let gui_for_close = gui.clone();
                 let window_for_close = window.clone();

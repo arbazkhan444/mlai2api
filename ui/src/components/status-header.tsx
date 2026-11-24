@@ -33,7 +33,10 @@ export function StatusHeader({ onOpenPalette }: { onOpenPalette?: () => void }) 
     start.mutate(undefined, {
       onError: async (error) => {
         const match = /port (\d+) is already in use/i.exec(String(error));
-        if (!match) return;
+        if (!match) {
+          toast.add({ type: "error", title: "Could not start the proxy", description: String(error) });
+          return;
+        }
         const port = Number(match[1]);
         const next = await invoke<number>("free_port", { after: port }).catch(() => null);
         setConflict({ port, next });

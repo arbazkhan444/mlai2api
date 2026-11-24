@@ -5,6 +5,18 @@ use mlai_bridge_core::auth;
 use mlai_bridge_core::config::{default_config_path, new_api_key, Config};
 use std::path::PathBuf;
 
+/// Hide the console window a GUI launch would otherwise keep open; `serve` and the other
+/// CLI commands still print, so only the desktop panel hides it.
+#[cfg(windows)]
+fn hide_console() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    let console = unsafe { GetConsoleWindow() };
+    if !console.is_null() {
+        unsafe { ShowWindow(console, SW_HIDE) };
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "mlai-bridge", version, about = "OpenAI-compatible local bridge to ML AI Code")]
 struct Cli {
@@ -47,7 +59,11 @@ fn main() {
         .init();
 
     let result = match cli.command.unwrap_or(Command::Gui) {
-        Command::Gui => gui::run(config_path),
+        Command::Gui => {
+            #[cfg(windows)]
+            hide_console();
+            gui::run(config_path)
+        }
         Command::Serve { port } => serve(config_path, port),
         Command::Init { force } => init(config_path, force),
         Command::Doctor => doctor(config_path),

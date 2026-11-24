@@ -26,3 +26,6 @@ Thumbs.db
 
 # UI verification screenshots
 /ui/.screens/
+
+# Desktop preferences written next to a repo-local config
+/desktop.json

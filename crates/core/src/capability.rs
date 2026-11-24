@@ -57,6 +57,17 @@ pub fn default_vision(real: &str) -> bool {
     !matches!(real, "glm-5.3" | "ml-ai-forge")
 }
 
+/// Context windows measured from the start response. A static fallback matters on the very
+/// first request for a model, before its run has been minted: judging a 400k prompt against
+/// the generic 200k default would refuse a model that actually accepts a million tokens.
+pub fn default_context(real: &str) -> i64 {
+    match real {
+        "pixis-opus" => 1_048_576,
+        "ml-ai-forge" => 110_000,
+        _ => DEFAULT_CONTEXT,
+    }
+}
+
 /// The per-model envelope used to normalise one request.
 #[derive(Clone, Debug)]
 pub struct Capability {
@@ -78,7 +89,7 @@ impl Capability {
             .and_then(|o| o.context)
             .or_else(|| limits.map(|l| l.context))
             .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CONTEXT);
+            .unwrap_or_else(|| default_context(real));
         let output = over
             .and_then(|o| o.output)
             .or_else(|| limits.and_then(|l| l.output))
@@ -145,6 +156,12 @@ mod tests {
     fn opus_accepts_max() {
         let cap = Capability::resolve("pixis-opus", None, &config());
         assert_eq!(cap.effort(Some("max"), None), Some(Effort::Max));
+    }
+
+    #[test]
+    fn opus_has_a_million_token_window_before_any_run() {
+        let cap = Capability::resolve("pixis-opus", None, &config());
+        assert_eq!(cap.context, 1_048_576);
     }
 
     #[test]

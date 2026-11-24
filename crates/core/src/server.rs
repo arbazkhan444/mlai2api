@@ -233,7 +233,13 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
         .pointer("/stream_options/include_usage")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let limits = state.pool.limits_for(&resolved.real).await;
+    let mut limits = state.pool.limits_for(&resolved.real).await;
+    if limits.is_none() {
+        // The start response carries the real window. Learn it before judging the prompt,
+        // otherwise a large request is refused against the generic default on a cold cache.
+        let _ = state.pool.ensure(&resolved.real).await;
+        limits = state.pool.limits_for(&resolved.real).await;
+    }
     let capability = crate::capability::Capability::resolve(&resolved.real, limits.as_ref(), &state.config);
     let mut upstream_body = rewrite_request(&body, &state.config, &resolved.real, &capability);
     let effort = effort_of(&upstream_body);

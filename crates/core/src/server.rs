@@ -231,8 +231,28 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
         .unwrap_or(false);
     let limits = state.pool.limits_for(&resolved.real).await;
     let capability = crate::capability::Capability::resolve(&resolved.real, limits.as_ref(), &state.config);
-    let upstream_body = rewrite_request(&body, &state.config, &resolved.real, &capability);
+    let mut upstream_body = rewrite_request(&body, &state.config, &resolved.real, &capability);
     let effort = effort_of(&upstream_body);
+    if let Err(overflow) = crate::context::enforce(&mut upstream_body, &capability, &state.config) {
+        let message = format!(
+            "Prompt is about {} tokens; this model accepts {} including room for the answer. Compact the conversation or start a new one.",
+            overflow.estimate, overflow.limit
+        );
+        let value = json!({"error": {
+            "message": message.clone(),
+            "type": "invalid_request_error",
+            "code": "context_overflow",
+            "estimated": overflow.estimate,
+            "limit": overflow.limit
+        }});
+        record(&state, RecordArgs {
+            model: &resolved.alias, real_model: &resolved.real, stream, status: 400,
+            ms: started.elapsed().as_millis() as i64, effort: effort.clone(), first_token_ms: None,
+            ctx: None, error: Some(message),
+            bodies: Some(BodyPair { request: upstream_body.clone(), response: value.clone() }),
+        });
+        return json_response(StatusCode::BAD_REQUEST, value);
+    }
 
     // A request may span two runs: when a run's budget is spent the gateway answers
     // 402 billing_limit; an expired token answers 401 run_token_invalid. Either way a

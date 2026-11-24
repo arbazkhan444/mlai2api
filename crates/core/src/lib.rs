@@ -3,6 +3,7 @@ pub mod accounts;
 pub mod auth;
 pub mod capability;
 pub mod config;
+pub mod context;
 pub mod mlai;
 pub mod server;
 pub mod store;

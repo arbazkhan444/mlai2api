@@ -80,9 +80,15 @@ pub async fn start_proxy(
         account_label,
         started: chrono::Utc::now().timestamp_millis(),
     };
-    let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
-        .await
-        .with_context(|| format!("bind {}:{}", config.host, config.port))?;
+    let listener = match tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(anyhow::anyhow!("The port {} is already in use. Pick another port in Settings, or use the suggested one.", config.port));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!("bind {}:{}", config.host, config.port)));
+        }
+    };
     let addr = listener.local_addr()?;
     let app = server::router(state.clone());
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

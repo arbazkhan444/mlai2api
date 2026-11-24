@@ -8,21 +8,52 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopSettings {
+    pub autostart: bool,
+    pub start_hidden: bool,
+    pub close_to_tray: bool,
+}
+
+impl Default for DesktopSettings {
+    fn default() -> Self {
+        DesktopSettings { autostart: false, start_hidden: false, close_to_tray: false }
+    }
+}
+
+fn read_desktop_settings(path: &PathBuf) -> DesktopSettings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_desktop_settings(path: &PathBuf, settings: &DesktopSettings) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())? + "\n";
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
 
 pub struct GuiState {
     config_path: PathBuf,
     config: Mutex<Config>,
     credential: Mutex<Option<Credential>>,
     proxy: tokio::sync::Mutex<Option<ProxyHandle>>,
+    desktop_path: PathBuf,
+    desktop: Mutex<DesktopSettings>,
 }
 
 impl GuiState {
     fn new(config_path: PathBuf, config: Config) -> Self {
+        let desktop_path = config_path.with_file_name("desktop.json");
+        let desktop = read_desktop_settings(&desktop_path);
         GuiState {
             config_path,
             config: Mutex::new(config),
             credential: Mutex::new(None),
             proxy: tokio::sync::Mutex::new(None),
+            desktop_path,
+            desktop: Mutex::new(desktop),
         }
     }
 
@@ -115,6 +146,26 @@ impl GuiState {
         Ok(json!({"ok": true, "restartRequired": running}))
     }
 
+    fn desktop_settings_value(&self) -> Value {
+        json!(self.desktop.lock().unwrap().clone())
+    }
+
+    fn set_desktop_value(&self, settings: Value) -> Result<Value, String> {
+        let mut current = self.desktop.lock().unwrap().clone();
+        if let Some(v) = settings.get("autostart").and_then(|v| v.as_bool()) {
+            current.autostart = v;
+        }
+        if let Some(v) = settings.get("startHidden").and_then(|v| v.as_bool()) {
+            current.start_hidden = v;
+        }
+        if let Some(v) = settings.get("closeToTray").and_then(|v| v.as_bool()) {
+            current.close_to_tray = v;
+        }
+        write_desktop_settings(&self.desktop_path, &current)?;
+        *self.desktop.lock().unwrap() = current.clone();
+        Ok(json!(current))
+    }
+
     fn accounts(&self) -> Result<Accounts, String> {
         let config = self.config.lock().unwrap().clone();
         Accounts::open(std::path::Path::new(&config.accounts_path)).map_err(|e| e.to_string())
@@ -152,6 +203,10 @@ impl GuiState {
                     "tokenHint": account.token_hint,
                     "createdAt": account.created_at,
                     "lastUsed": account.last_used,
+                    "expires": account.expires,
+                    "lastCheckAt": account.last_check_at,
+                    "lastCheckOk": account.last_check_ok,
+                    "lastError": account.last_error,
                     "active": file.active.as_deref() == Some(account.id.as_str()),
                 })
             })
@@ -161,6 +216,30 @@ impl GuiState {
             "active": file.active,
             "path": self.config.lock().unwrap().accounts_path,
         }))
+    }
+
+    /// Verify each account's device token with a read-only whoami call and store the outcome.
+    async fn accounts_check_value(&self, id: Option<String>) -> Result<Value, String> {
+        let accounts = self.accounts()?;
+        let file = accounts.file();
+        let targets = match id {
+            Some(id) => vec![file.find(&id).cloned().ok_or_else(|| "no such account".to_string())?],
+            None => file.accounts.clone(),
+        };
+        let mut out = Vec::new();
+        for account in targets {
+            let started = std::time::Instant::now();
+            let result = match accounts.token(&account.id) {
+                Ok(token) => mlai_bridge_core::mlai::MlaiClient::new(&account.server, &token).whoami().await,
+                Err(error) => Err(error),
+            };
+            let ms = started.elapsed().as_millis() as i64;
+            let error = result.as_ref().err().map(|e| format!("{:#}", e));
+            let ok = result.is_ok();
+            let _ = accounts.record_check(&account.id, ok, error.clone());
+            out.push(json!({"id": account.id, "ok": ok, "ms": ms, "error": error}));
+        }
+        Ok(json!(out))
     }
 
     async fn accounts_add_value(&self, token: String, label: Option<String>, server: Option<String>) -> Result<Value, String> {
@@ -237,7 +316,7 @@ impl GuiState {
         let accounts = self.accounts()?;
         let first = accounts.file().accounts.is_empty();
         accounts
-            .add(&label, credential.server.trim_end_matches('/'), &credential.token)
+            .add_full(&label, credential.server.trim_end_matches('/'), &credential.token, credential.expires)
             .map_err(|e| e.to_string())?;
         if first {
             self.restart_if_running().await?;
@@ -271,11 +350,53 @@ impl GuiState {
         Ok(json!({"running": false}))
     }
 
+    /// One tiny real request through the local proxy, so the check exercises the same path as clients.
+    async fn test_connection_value(&self, requested: Option<String>) -> Result<Value, String> {
+        let (base, key, model) = {
+            let proxy = self.proxy.lock().await;
+            let Some(handle) = proxy.as_ref() else {
+                return Err("The proxy is not running. Start it first.".into());
+            };
+            let config = handle.state.config.clone();
+            let model = match requested {
+                Some(model) if !model.trim().is_empty() => model,
+                _ if config.aliases.contains_key(&config.default_model) => config.default_model.clone(),
+                _ => config.aliases.keys().next().cloned().unwrap_or(config.default_model.clone()),
+            };
+            (handle.base_url(), config.api_key.clone(), model)
+        };
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+            "max_tokens": 16,
+            "stream": false
+        });
+        let started = std::time::Instant::now();
+        let sent = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", base))
+            .bearer_auth(&key)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(45))
+            .send()
+            .await;
+        let ms = started.elapsed().as_millis() as i64;
+        match sent {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let ok = response.status().is_success();
+                let text = response.text().await.unwrap_or_default();
+                let snippet: String = text.chars().take(400).collect();
+                Ok(json!({"ok": ok, "ms": ms, "status": status, "model": model, "body": snippet}))
+            }
+            Err(error) => Ok(json!({"ok": false, "ms": ms, "status": 0, "model": model, "error": format!("{:#}", error)})),
+        }
+    }
+
     async fn history_value(&self, limit: Option<i64>) -> Result<Vec<RequestRow>, String> {
         let config = self.config.lock().unwrap().clone();
         let store = Store::open(std::path::Path::new(&config.history_path), config.body_keep, config.body_max_bytes).map_err(|e| e.to_string())?;
         store
-            .recent(limit.unwrap_or(50).clamp(1, 500))
+            .recent(limit.unwrap_or(50).clamp(1, 5000))
             .map_err(|e| e.to_string())
     }
 
@@ -295,6 +416,16 @@ impl GuiState {
             "byAccount": store.by_account().unwrap_or_default(),
             "tokensPerCredit": mlai_bridge_core::store::TOKENS_PER_CREDIT,
         }))
+    }
+
+    async fn usage_window_value(&self, from_ms: i64, to_ms: i64, buckets: i64) -> Result<Value, String> {
+        let config = self.config.lock().unwrap().clone();
+        let store = Store::open(std::path::Path::new(&config.history_path), config.body_keep, config.body_max_bytes).map_err(|e| e.to_string())?;
+        let mut value = store.window(from_ms, to_ms, buckets).map_err(|e| e.to_string())?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert("tokensPerCredit".into(), json!(mlai_bridge_core::store::TOKENS_PER_CREDIT));
+        }
+        Ok(value)
     }
 
     async fn request_detail_value(&self, id: i64) -> Result<Value, String> {
@@ -355,6 +486,10 @@ async fn stop(state: State<'_, Arc<GuiState>>) -> Result<Value, String> {
     state.stop_value().await
 }
 #[tauri::command]
+async fn test_connection(state: State<'_, Arc<GuiState>>, model: Option<String>) -> Result<Value, String> {
+    state.test_connection_value(model).await
+}
+#[tauri::command]
 async fn history(state: State<'_, Arc<GuiState>>, limit: Option<i64>) -> Result<Vec<RequestRow>, String> {
     state.history_value(limit).await
 }
@@ -373,6 +508,10 @@ async fn mint_limits(state: State<'_, Arc<GuiState>>) -> Result<Value, String> {
 #[tauri::command]
 async fn usage(state: State<'_, Arc<GuiState>>) -> Result<Value, String> {
     state.usage_value().await
+}
+#[tauri::command]
+async fn usage_window(state: State<'_, Arc<GuiState>>, from_ms: i64, to_ms: i64, buckets: i64) -> Result<Value, String> {
+    state.usage_window_value(from_ms, to_ms, buckets).await
 }
 /// Which tab to open first (MLAI_BRIDGE_TAB=usage|proxy), for screenshots and demos.
 #[tauri::command]
@@ -407,6 +546,46 @@ async fn accounts_remove(state: State<'_, Arc<GuiState>>, id: String) -> Result<
 #[tauri::command]
 async fn accounts_import(state: State<'_, Arc<GuiState>>) -> Result<Value, String> {
     state.accounts_import_value().await
+}
+#[tauri::command]
+async fn accounts_check(state: State<'_, Arc<GuiState>>, id: Option<String>) -> Result<Value, String> {
+    state.accounts_check_value(id).await
+}
+
+#[tauri::command]
+fn desktop_settings(state: State<'_, Arc<GuiState>>) -> Value {
+    state.desktop_settings_value()
+}
+
+#[tauri::command]
+fn set_desktop_settings(app: tauri::AppHandle, state: State<'_, Arc<GuiState>>, settings: Value) -> Result<Value, String> {
+    let before = state.desktop.lock().unwrap().autostart;
+    let value = state.set_desktop_value(settings)?;
+    let after = value.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
+    if after != before {
+        use tauri_plugin_autostart::ManagerExt;
+        let manager = app.autolaunch();
+        if after {
+            manager.enable().map_err(|e| e.to_string())?;
+        } else {
+            manager.disable().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+fn free_port(after: u16) -> Result<u16, String> {
+    for offset in 1..=50u32 {
+        let port = after as u32 + offset;
+        if port > 65535 {
+            break;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok() {
+            return Ok(port as u16);
+        }
+    }
+    Err("No free port in the next 50 ports.".into())
 }
 
 #[tauri::command]
@@ -445,11 +624,29 @@ fn writable_data_dir() -> PathBuf {
 }
 
 pub fn run(config_path: PathBuf) -> anyhow::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
     let (config, _exists) = Config::load(&config_path)?;
     let state = Arc::new(GuiState::new(config_path, config));
+    let hidden_on_launch = state.desktop.lock().unwrap().start_hidden || std::env::args().any(|a| a == "--minimized");
+
     tauri::Builder::default()
+        // Must be the first plugin so a second launch forwards to this instance instead of opening a new window.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .manage(state)
-        .setup(|app| {
+        .setup(move |app| {
             let gui = app.state::<Arc<GuiState>>().inner().clone();
             tauri::async_runtime::spawn({
                 let gui = gui.clone();
@@ -464,20 +661,84 @@ pub fn run(config_path: PathBuf) -> anyhow::Result<()> {
                     }
                 }
             });
+
+            let show_item = MenuItem::with_id(app, "show", "Open MLAI Bridge", true, None::<&str>)?;
+            let start_item = MenuItem::with_id(app, "start", "Start proxy", true, None::<&str>)?;
+            let stop_item = MenuItem::with_id(app, "stop", "Stop proxy", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &start_item, &stop_item, &quit_item])?;
+            TrayIconBuilder::with_id("mlai-tray")
+                .tooltip("MLAI Bridge")
+                .icon(app.default_window_icon().cloned().ok_or_else(|| anyhow::anyhow!("no window icon"))?)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "start" | "stop" => {
+                        let gui = app.state::<Arc<GuiState>>().inner().clone();
+                        let start = event.id().as_ref() == "start";
+                        tauri::async_runtime::spawn(async move {
+                            if start {
+                                let _ = gui.start_value().await;
+                            } else {
+                                let _ = gui.stop_value().await;
+                            }
+                        });
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+            tracing::info!("tray icon created");
+
             let data_dir = writable_data_dir();
             tracing::info!("webview data dir: {}", data_dir.display());
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+            let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
                 .title("MLAI Bridge")
                 .inner_size(1120.0, 760.0)
                 .min_inner_size(900.0, 600.0)
                 .center()
                 .data_directory(data_dir)
+                .background_color(tauri::window::Color(24, 24, 27, 255))
+                .visible(!hidden_on_launch)
                 .build()?;
+            {
+                let gui_for_close = gui.clone();
+                let window_for_close = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        if gui_for_close.desktop.lock().unwrap().close_to_tray {
+                            api.prevent_close();
+                            let _ = window_for_close.hide();
+                        }
+                    }
+                });
+            }
+            if !hidden_on_launch {
+                let _ = window.show();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            bootstrap, save_config, start, stop, history, clear_history, models, mint_limits, health, usage, request_detail,
-            accounts, accounts_add, accounts_activate, accounts_remove, accounts_import, startup_tab
+            bootstrap, save_config, start, stop, test_connection, history, clear_history, models, mint_limits, health, usage, usage_window, request_detail,
+            accounts, accounts_add, accounts_activate, accounts_remove, accounts_import, accounts_check,
+            desktop_settings, set_desktop_settings, free_port, startup_tab
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!(e))

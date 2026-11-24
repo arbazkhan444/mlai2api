@@ -16,7 +16,9 @@ long-lived API key. This bridge does that minting for you:
 
 1. You add an ML AI Code account (device token) once.
 2. On the first request for a model, the bridge calls `POST /api/laptop` with action `start` and keeps the
-   run token (re-minting shortly before it expires).
+   run token. Each run carries its own budget (40,000,000 weighted units today), so the bridge replaces the
+   run before that budget is spent, and again at once if the gateway refuses a call. The caller never sees
+   the swap: the identical request body is replayed, so the conversation continues in the client.
 3. It forwards the request to `https://code.ml.ai/api/model/v1/chat/completions` and streams the response
    back unchanged in OpenAI format.
 
@@ -46,7 +48,7 @@ chunk, tracks tokens/cache, and keeps a local record of every request.
 | Windows 10/11 x64 | the app and DPAPI account storage are Windows-first |
 | WebView2 runtime | bundled in Windows 11; the installer can fetch it on Windows 10 |
 | Rust (MSVC toolchain) + VS 2022 Build Tools (C++) | building from source |
-| Node.js 18+ | only for the Tauri CLI used by `bundle.cmd` |
+| Node.js 18+ | building the React UI in `ui/` and running the Tauri CLI |
 | An ML AI Code account | sign in with the `mlai` CLI, or paste a device token |
 
 Run `rustup show` — the default toolchain must be the **MSVC** one (`stable-x86_64-pc-windows-msvc`),
@@ -55,6 +57,15 @@ not the standalone GNU toolchain. All build scripts load `vcvars64.bat` for you.
 ---
 
 ## Build
+
+### UI (once, and after UI changes)
+
+```bat
+cd ui && npm install && npm run build
+```
+
+The desktop UI is a Vite + React + TypeScript app in `ui/`; Tauri embeds `ui\dist`, so it must exist
+before any cargo build. `npm run dev` (port 1420) serves it in a plain browser with sample data.
 
 ### Debug build (fast loop)
 
@@ -65,16 +76,18 @@ build.cmd build
 `build.cmd` loads the Visual Studio environment, points `TEMP` at `%LOCALAPPDATA%\Temp`, and forwards
 everything to `cargo`, so `build.cmd test`, `build.cmd run`, etc. also work.
 
-Output: `target\debug\mlai-bridge.exe`.
+Output: `target\debug\mlai-bridge.exe`. A plain debug build loads the UI from the dev server
+(`http://localhost:1420`), so run `npm run dev` in `ui/` alongside it, or use `ui\node_modules\.bin\tauri dev`
+from the repo root, which starts both.
 
 ### Release build + installer
 
 ```bat
-npm install --save-dev @tauri-apps/cli@^2   :: once
 bundle.cmd
 ```
 
-`bundle.cmd` runs `npx tauri build --ci` with the MSVC environment and produces:
+`bundle.cmd` runs `npx tauri build --ci` with the MSVC environment; Tauri runs `npm run build` in `ui/`
+first, then produces:
 
 - `target\release\mlai-bridge.exe` — the app
 - `target\release\bundle\nsis\MLAI Bridge_<version>_x64-setup.exe` — per-user installer (no admin required)
@@ -192,7 +205,7 @@ Rows written before account attribution existed are shown as **Unattributed**.
 | `aliases` | see above | client model name → upstream model id |
 | `reasoning` | `native` | how to surface reasoning: `native` / `reasoning` / `both` / `none` |
 | `reasoningEffort` | `low` | sent upstream when the client does not specify one |
-| `tokenSafetyMs` | `300000` | re-mint run tokens this long before expiry |
+| `tokenSafetyMs` | `300000` | re-mint run tokens this long before expiry; spending a run's budget is handled separately and does not wait for expiry |
 | `requestTimeoutMs` | `900000` | upstream timeout |
 | `historyPath` | auto | `requests.jsonl` metadata log |
 | `limitsCache` | auto | learned context/output limits |
@@ -229,6 +242,9 @@ bundle.cmd        release build + NSIS installer
 ## Troubleshooting
 
 - **`401 invalid_api_key`** — the client is sending the wrong bridge key; copy it from the Proxy tab.
+- **`402 billing_limit`** — the run's 40M unit budget is spent. The bridge replaces the run and replays the
+  request once, so this should not reach your client; if it does, compare `budget` and `consumed` in `/health`
+  and look for the `run ... was refused` warning in the log.
 - **`404 model_not_found`** — the alias does not exist and raw model ids are disabled; check `/v1/models`.
 - **Empty answers** — reasoning consumed `max_tokens`; lower effort or raise the limit.
 - **`No active account`** — add one on the Accounts tab, or run `mlai login` and import it.

@@ -173,6 +173,11 @@ struct RecordArgs<'a> {
 
 fn record(state: &AppState, args: RecordArgs<'_>) {
     let usage = args.ctx.and_then(|ctx| ctx.usage.as_ref());
+    if let Some(usage) = usage {
+        state
+            .pool
+            .note_usage(args.real_model, crate::mlai::weighted_units(usage));
+    }
     let row = NewRequest {
         model: args.model.to_string(),
         real_model: args.real_model.to_string(),
@@ -223,63 +228,62 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
     let upstream_body = rewrite_request(&body, &state.config, &resolved.real);
     let effort = effort_of(&upstream_body);
 
-    let entry = match state.pool.ensure(&resolved.real).await {
-        Ok(entry) => entry,
-        Err(error) => {
-            record(&state, RecordArgs {
-                model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
-                ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
-                ctx: None, error: Some(error.to_string()),
-                bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "run_token") }),
-            });
-            return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "run_token"));
-        }
-    };
-    let mut resp = match state.client.chat(&entry.gateway, &upstream_body, &entry.token, stream).await {
-        Ok(resp) => resp,
-        Err(error) => {
-            record(&state, RecordArgs {
-                model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
-                ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
-                ctx: None, error: Some(error.to_string()),
-                bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "upstream_unreachable") }),
-            });
-            return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "upstream_unreachable"));
-        }
-    };
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let text = resp.text().await.unwrap_or_default();
-        if text.contains("run_token_invalid") {
-            state.pool.invalidate(&resolved.real).await;
-            match state.pool.ensure(&resolved.real).await {
-                Ok(fresh) => {
-                    resp = match state.client.chat(&fresh.gateway, &upstream_body, &fresh.token, stream).await {
-                        Ok(resp) => resp,
-                        Err(error) => {
-                            record(&state, RecordArgs {
-                                model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
-                                ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
-                                ctx: None, error: Some(error.to_string()),
-                                bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "upstream_unreachable") }),
-                            });
-                            return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "upstream_unreachable"));
-                        }
-                    };
-                }
-                Err(error) => {
-                    return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "run_token"));
-                }
+    // A request may span two runs: when a run's budget is spent the gateway answers
+    // 402 billing_limit; an expired token answers 401 run_token_invalid. Either way a
+    // fresh run is minted and the same body is replayed once. Nothing has been written
+    // to the caller yet, so the coding agent's session continues without noticing.
+    let mut replayed = false;
+    let mut resp;
+    loop {
+        let entry = match state.pool.ensure(&resolved.real).await {
+            Ok(entry) => entry,
+            Err(error) => {
+                record(&state, RecordArgs {
+                    model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
+                    ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
+                    ctx: None, error: Some(error.to_string()),
+                    bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "run_token") }),
+                });
+                return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "run_token"));
             }
-        } else {
-            let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| error_payload(401, &text, "unauthorized"));
-            record(&state, RecordArgs {
-                model: &resolved.alias, real_model: &resolved.real, stream, status: 401,
-                ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
-                ctx: None, error: Some(text.clone()),
-                bodies: Some(BodyPair { request: upstream_body.clone(), response: value.clone() }),
-            });
-            return json_response(StatusCode::UNAUTHORIZED, value);
+        };
+        resp = match state.client.chat(&entry.gateway, &upstream_body, &entry.token, stream).await {
+            Ok(resp) => resp,
+            Err(error) => {
+                record(&state, RecordArgs {
+                    model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
+                    ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
+                    ctx: None, error: Some(error.to_string()),
+                    bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "upstream_unreachable") }),
+                });
+                return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "upstream_unreachable"));
+            }
+        };
+        let status = resp.status();
+        if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::PAYMENT_REQUIRED {
+            break;
         }
+        let text = resp.text().await.unwrap_or_default();
+        let run_refused = text.contains("run_token_invalid") || text.contains("billing_limit");
+        if run_refused && !replayed {
+            replayed = true;
+            state.pool.invalidate(&resolved.real).await;
+            tracing::warn!(
+                "run for {} was refused ({}); minting a fresh run and replaying the request once",
+                resolved.real, status
+            );
+            continue;
+        }
+        let value: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| error_payload(status.as_u16(), &text.chars().take(800).collect::<String>(), "upstream_error"));
+        record(&state, RecordArgs {
+            model: &resolved.alias, real_model: &resolved.real, stream, status: status.as_u16(),
+            ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
+            ctx: None, error: Some(text.chars().take(500).collect::<String>()),
+            bodies: Some(BodyPair { request: upstream_body.clone(), response: value.clone() }),
+        });
+        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        return json_response(code, value);
     }
 
     let status = resp.status();

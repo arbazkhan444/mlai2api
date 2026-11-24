@@ -16,7 +16,9 @@ long-lived API key. This bridge does that minting for you:
 
 1. You add an ML AI Code account (device token) once.
 2. On the first request for a model, the bridge calls `POST /api/laptop` with action `start` and keeps the
-   run token (re-minting shortly before it expires).
+   run token. Each run carries its own budget (40,000,000 weighted units today), so the bridge replaces the
+   run before that budget is spent, and again at once if the gateway refuses a call. The caller never sees
+   the swap: the identical request body is replayed, so the conversation continues in the client.
 3. It forwards the request to `https://code.ml.ai/api/model/v1/chat/completions` and streams the response
    back unchanged in OpenAI format.
 
@@ -203,7 +205,7 @@ Rows written before account attribution existed are shown as **Unattributed**.
 | `aliases` | see above | client model name → upstream model id |
 | `reasoning` | `native` | how to surface reasoning: `native` / `reasoning` / `both` / `none` |
 | `reasoningEffort` | `low` | sent upstream when the client does not specify one |
-| `tokenSafetyMs` | `300000` | re-mint run tokens this long before expiry |
+| `tokenSafetyMs` | `300000` | re-mint run tokens this long before expiry; spending a run's budget is handled separately and does not wait for expiry |
 | `requestTimeoutMs` | `900000` | upstream timeout |
 | `historyPath` | auto | `requests.jsonl` metadata log |
 | `limitsCache` | auto | learned context/output limits |
@@ -240,6 +242,9 @@ bundle.cmd        release build + NSIS installer
 ## Troubleshooting
 
 - **`401 invalid_api_key`** — the client is sending the wrong bridge key; copy it from the Proxy tab.
+- **`402 billing_limit`** — the run's 40M unit budget is spent. The bridge replaces the run and replays the
+  request once, so this should not reach your client; if it does, compare `budget` and `consumed` in `/health`
+  and look for the `run ... was refused` warning in the log.
 - **`404 model_not_found`** — the alias does not exist and raw model ids are disabled; check `/v1/models`.
 - **Empty answers** — reasoning consumed `max_tokens`; lower effort or raise the limit.
 - **`No active account`** — add one on the Accounts tab, or run `mlai login` and import it.

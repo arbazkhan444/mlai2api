@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 pub const DEFAULT_GATEWAY: &str = "https://code.ml.ai/api/model/v1";
@@ -204,10 +205,51 @@ pub struct RunPool {
     cache: Mutex<HashMap<String, RunToken>>,
     mint_lock: Mutex<()>,
     limits: Mutex<BTreeMap<String, Limits>>,
+    /// Weighted units spent on the run currently cached for each model, since it was minted.
+    consumed: StdMutex<HashMap<String, i64>>,
 }
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// How much of a run's budget one response consumed, in the gateway's own units:
+/// fresh input at 1x, cached input at 0.2x, output at 3x. These are the weights
+/// the ML AI Code engine uses (lib/plans.ts, `billable_tokens`), so the count here
+/// matches the number the server enforces.
+pub fn weighted_units(usage: &Value) -> i64 {
+    let num = |value: Option<&Value>| value.and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let read = num(usage.get("cache_read_input_tokens"));
+    let prompt = match usage.get("prompt_tokens").and_then(|v| v.as_i64()) {
+        Some(prompt) => prompt.max(0),
+        None => num(usage.get("input_tokens")) + read + num(usage.get("cache_creation_input_tokens")),
+    };
+    let output = match usage.get("completion_tokens").and_then(|v| v.as_i64()) {
+        Some(output) => output.max(0),
+        None => num(usage.get("output_tokens")),
+    };
+    if prompt == 0 && output == 0 {
+        return num(usage.get("total_tokens"));
+    }
+    let cached = num(usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .max(num(usage.get("cached_tokens")))
+        .max(read)
+        .min(prompt);
+    let fresh = prompt - cached;
+    fresh + (cached * 2) / 10 + output * 3
+}
+
+/// Whether a run should be replaced before the next call. The reserve keeps one
+/// more request's worth of budget (10%, capped at 4M) so a large prompt does not
+/// cross the cap mid-flight. A run without a budget is not capped by the server.
+pub fn needs_refresh(entry: &RunToken, used: i64) -> bool {
+    match entry.budget {
+        Some(budget) if budget > 0 => {
+            let reserve = (budget / 10).min(4_000_000);
+            used >= budget.saturating_sub(reserve)
+        }
+        _ => false,
+    }
 }
 
 impl RunPool {
@@ -227,6 +269,7 @@ impl RunPool {
             cache: Mutex::new(HashMap::new()),
             mint_lock: Mutex::new(()),
             limits: Mutex::new(limits),
+            consumed: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -238,23 +281,47 @@ impl RunPool {
         self.limits.lock().await.clone()
     }
 
+    /// Units already spent on the cached run for this model, since it was minted.
+    pub fn consumed_of(&self, model: &str) -> i64 {
+        self.consumed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(model)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Records what a response cost, so the next call can replace the run before
+    /// the gateway refuses it. Safe to call from sync code (the history writer).
+    pub fn note_usage(&self, model: &str, units: i64) {
+        if units <= 0 {
+            return;
+        }
+        let mut consumed = self
+            .consumed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *consumed.entry(model.to_string()).or_insert(0) += units;
+    }
+
+    /// The cached run, while it has not expired and still has budget left.
+    async fn reusable(&self, model: &str) -> Option<RunToken> {
+        let used = self.consumed_of(model);
+        let cache = self.cache.lock().await;
+        let hit = cache.get(model)?;
+        if hit.expires - now_ms() > self.safety_ms && !needs_refresh(hit, used) {
+            return Some(hit.clone());
+        }
+        None
+    }
+
     pub async fn ensure(&self, model: &str) -> Result<RunToken> {
-        {
-            let cache = self.cache.lock().await;
-            if let Some(hit) = cache.get(model) {
-                if hit.expires - now_ms() > self.safety_ms {
-                    return Ok(hit.clone());
-                }
-            }
+        if let Some(hit) = self.reusable(model).await {
+            return Ok(hit);
         }
         let _guard = self.mint_lock.lock().await;
-        {
-            let cache = self.cache.lock().await;
-            if let Some(hit) = cache.get(model) {
-                if hit.expires - now_ms() > self.safety_ms {
-                    return Ok(hit.clone());
-                }
-            }
+        if let Some(hit) = self.reusable(model).await {
+            return Ok(hit);
         }
         let started = now_ms();
         let data = self
@@ -282,6 +349,11 @@ impl RunPool {
             budget: data.budget,
         };
         let old = self.cache.lock().await.insert(model.to_string(), entry.clone());
+        // A fresh run starts with its whole budget again.
+        self.consumed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(model.to_string(), 0);
         if let Some(old) = old {
             if old.token != entry.token {
                 let client = self.client.clone();
@@ -318,6 +390,10 @@ impl RunPool {
     }
 
     pub async fn invalidate(&self, model: &str) {
+        self.consumed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(model);
         if let Some(old) = self.cache.lock().await.remove(model) {
             let client = self.client.clone();
             tokio::spawn(async move {
@@ -348,7 +424,8 @@ impl RunPool {
             .values()
             .map(|t| {
                 json!({
-                    "model": t.model, "runId": t.run_id, "expires": t.expires, "budget": t.budget
+                    "model": t.model, "runId": t.run_id, "expires": t.expires, "budget": t.budget,
+                    "consumed": self.consumed_of(&t.model)
                 })
             })
             .collect()
@@ -363,4 +440,62 @@ pub fn credential_summary(cred: &Credential) -> Value {
         "expires": cred.expires,
         "tokenPrefix": cred.token.chars().take(6).collect::<String>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(budget: Option<i64>) -> RunToken {
+        RunToken {
+            model: "pixis-opus".into(),
+            token: "mlrun_test".into(),
+            gateway: DEFAULT_GATEWAY.into(),
+            expires: now_ms() + 3_600_000,
+            run_id: None,
+            budget,
+        }
+    }
+
+    #[test]
+    fn weights_match_the_engine() {
+        // 1000 prompt, 800 of it cached, 100 out: 200 fresh + 160 cached + 300 output.
+        let usage = json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 800}
+        });
+        assert_eq!(weighted_units(&usage), 660);
+    }
+
+    #[test]
+    fn cached_tokens_are_capped_at_the_prompt() {
+        let usage = json!({"prompt_tokens": 10, "completion_tokens": 0, "cached_tokens": 99});
+        // cached clamped to 10: 0 fresh + 2 cached + 0 output.
+        assert_eq!(weighted_units(&usage), 2);
+    }
+
+    #[test]
+    fn absent_usage_counts_nothing() {
+        assert_eq!(weighted_units(&json!({})), 0);
+    }
+
+    #[test]
+    fn uncapped_runs_never_refresh() {
+        assert!(!needs_refresh(&run(None), i64::MAX));
+    }
+
+    #[test]
+    fn refresh_reserves_the_last_tenth() {
+        let entry = run(Some(40_000_000));
+        assert!(!needs_refresh(&entry, 35_999_999));
+        assert!(needs_refresh(&entry, 36_000_000));
+    }
+
+    #[test]
+    fn small_budgets_reserve_only_a_tenth() {
+        let entry = run(Some(1_000_000));
+        assert!(!needs_refresh(&entry, 899_999));
+        assert!(needs_refresh(&entry, 900_000));
+    }
 }

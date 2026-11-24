@@ -1,5 +1,6 @@
 //! mlai-bridge-core: the proxy, the run-token pool, config, credentials and history.
 pub mod accounts;
+pub mod anthropic;
 pub mod auth;
 pub mod capability;
 pub mod config;

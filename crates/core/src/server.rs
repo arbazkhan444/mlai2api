@@ -42,6 +42,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models/:id", get(model_one))
         .route("/v1/chat/completions", post(chat))
         .route("/chat/completions", post(chat))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -358,6 +360,216 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
         bodies: Some(BodyPair { request: upstream_body, response: value }),
     });
     json_response(StatusCode::OK, out)
+}
+
+/// Splits complete SSE frames out of a growing buffer and returns their `data:` payloads.
+/// `[DONE]` and empty payloads are dropped.
+fn drain_frames(buffer: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(index) = buffer.find("\n\n") {
+        let frame: String = buffer[..index].to_string();
+        buffer.drain(..index + 2);
+        for line in frame.split('\n') {
+            let line = line.trim();
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            out.push(payload.to_string());
+        }
+    }
+    out
+}
+
+fn anthropic_error(status: StatusCode, kind: &str, message: &str) -> Response {
+    json_response(
+        status,
+        json!({"type": "error", "error": {"type": kind, "message": message}}),
+    )
+}
+
+fn anthropic_error_kind(status: u16) -> &'static str {
+    match status {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        500..=599 => "api_error",
+        _ => "invalid_request_error",
+    }
+}
+
+/// Re-shapes an OpenAI error response from the canonical path into the Anthropic envelope.
+async fn anthropic_error_from(response: Response) -> Response {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let message = value
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("The request failed.")
+        .to_string();
+    let mut error = json!({"type": anthropic_error_kind(status.as_u16()), "message": message});
+    if let Some(code) = value.pointer("/error/code").and_then(|v| v.as_str()) {
+        error["code"] = json!(code);
+    }
+    json_response(status, json!({"type": "error", "error": error}))
+}
+
+/// Anthropic Messages in, the canonical OpenAI path underneath, Anthropic events out.
+async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !authorized(&state.config, &headers) {
+        return anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "Invalid bridge API key. Use the apiKey from config.json as the API key in your client.",
+        );
+    }
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The request body must be a JSON object",
+            )
+        }
+    };
+    let mut openai = crate::anthropic::to_openai(&parsed);
+    let stream = openai
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if stream {
+        // The translator needs the final usage to fill message_delta.
+        openai["stream_options"] = json!({"include_usage": true});
+    }
+    let encoded = match serde_json::to_vec(&openai) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The request could not be encoded",
+            )
+        }
+    };
+    let response = chat(State(state), headers, Bytes::from(encoded)).await;
+    if response.status() != StatusCode::OK {
+        return anthropic_error_from(response).await;
+    }
+    if stream {
+        return anthropic_stream(response, openai);
+    }
+    let bytes = match axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "The reply could not be read",
+            )
+        }
+    };
+    let normalized: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return anthropic_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "The reply could not be read",
+            )
+        }
+    };
+    let alias = normalized
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    json_response(
+        StatusCode::OK,
+        crate::anthropic::from_completion(&normalized, alias),
+    )
+}
+
+async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !authorized(&state.config, &headers) {
+        return anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "Invalid bridge API key.",
+        );
+    }
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The request body must be a JSON object",
+            )
+        }
+    };
+    let openai = crate::anthropic::to_openai(&parsed);
+    json_response(
+        StatusCode::OK,
+        json!({"input_tokens": crate::context::estimate_tokens(&openai)}),
+    )
+}
+
+/// Reads the canonical OpenAI stream and re-emits it as Anthropic events.
+fn anthropic_stream(response: Response, openai: Value) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let alias = openai
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let input_tokens = crate::context::estimate_tokens(&openai);
+    tokio::spawn(async move {
+        let mut translator = crate::anthropic::Stream::new(&alias, input_tokens);
+        for event in translator.start() {
+            if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                return;
+            }
+        }
+        let mut buffer = String::new();
+        let mut usage: Option<Value> = None;
+        let mut upstream = response.into_body().into_data_stream();
+        while let Some(chunk) = upstream.next().await {
+            let Ok(bytes) = chunk else { break };
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            for payload in drain_frames(&mut buffer) {
+                let Ok(value) = serde_json::from_str::<Value>(&payload) else {
+                    continue;
+                };
+                if value.get("usage").map(|v| !v.is_null()).unwrap_or(false) {
+                    usage = Some(value["usage"].clone());
+                }
+                for event in translator.feed(&value) {
+                    if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        for event in translator.finish(usage.as_ref()) {
+            let _ = tx.send(Ok(Bytes::from(event))).await;
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache, no-transform")
+        .header("Connection", "keep-alive")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
 }
 
 fn merge_tool_call(acc: &mut Vec<Value>, delta: &Value) {

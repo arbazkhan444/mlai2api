@@ -109,6 +109,7 @@ async fn usage(State(state): State<AppState>) -> Response {
             "byModel": state.store.by_model().unwrap_or_default(),
             "byAccount": state.store.by_account().unwrap_or_default(),
             "activeAccount": { "id": state.account_id, "label": state.account_label },
+            "rejections": state.pool.rejections(),
             "tokensPerCredit": crate::store::TOKENS_PER_CREDIT,
         }),
     )
@@ -248,6 +249,7 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
             "estimated": overflow.estimate,
             "limit": overflow.limit
         }});
+        state.pool.note_rejection(&resolved.real, "context_overflow");
         record(&state, RecordArgs {
             model: &resolved.alias, real_model: &resolved.real, stream, status: 400,
             ms: started.elapsed().as_millis() as i64, effort: effort.clone(), first_token_ms: None,
@@ -299,6 +301,16 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
         let run_refused = text.contains("run_token_invalid")
             || text.contains("billing_limit")
             || text.contains("run_finished");
+        let refusal = if text.contains("billing_limit") {
+            "billing_limit"
+        } else if text.contains("run_token_invalid") {
+            "run_token_invalid"
+        } else if text.contains("run_finished") {
+            "run_finished"
+        } else {
+            "run_refused"
+        };
+        state.pool.note_rejection(&resolved.real, refusal);
         if run_refused && !replayed {
             replayed = true;
             state.pool.invalidate(&resolved.real).await;
@@ -323,6 +335,9 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        state
+            .pool
+            .note_rejection(&resolved.real, &format!("upstream_{}", status.as_u16()));
         let value: Value = serde_json::from_str(&text)
             .unwrap_or_else(|_| error_payload(status.as_u16(), &text.chars().take(800).collect::<String>(), "upstream_error"));
         record(&state, RecordArgs {

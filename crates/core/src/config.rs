@@ -19,6 +19,19 @@ impl Default for ReasoningMode {
     }
 }
 
+/// Per-model overrides for what the upstream accepts. Everything is optional: absent fields
+/// fall back to the run token's limits, then to the built-in defaults.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CapabilityOverride {
+    pub context: Option<i64>,
+    pub output: Option<i64>,
+    pub vision: Option<bool>,
+    pub efforts: Option<Vec<String>>,
+    pub tools: Option<bool>,
+    pub parallel_tools: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
@@ -43,6 +56,7 @@ pub struct Config {
     pub body_keep: i64,
     pub body_max_bytes: i64,
     pub accounts_path: String,
+    pub capabilities: BTreeMap<String, CapabilityOverride>,
 }
 
 impl Default for Config {
@@ -69,6 +83,7 @@ impl Default for Config {
             body_keep: 200,
             body_max_bytes: 64 * 1024 * 1024,
             accounts_path: String::new(),
+            capabilities: BTreeMap::new(),
         }
     }
 }

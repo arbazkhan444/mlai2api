@@ -1,4 +1,5 @@
 //! Model aliases and OpenAI wire normalization.
+use crate::capability::{Capability, Effort};
 use crate::config::{Config, ReasoningMode};
 use serde_json::{json, Map, Value};
 
@@ -34,32 +35,88 @@ pub fn resolve_model(requested: Option<&str>, cfg: &Config, catalog: &[String]) 
     ))
 }
 
-pub fn rewrite_request(body: &Value, cfg: &Config, real: &str) -> Value {
-    let mut out = body.clone();
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("model".into(), json!(real));
-        let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-        if stream && cfg.always_include_usage {
-            let mut options = obj
-                .get("stream_options")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-            options.insert("include_usage".into(), json!(true));
-            obj.insert("stream_options".into(), Value::Object(options));
-        }
-        if let Some(effort) = &cfg.reasoning_effort {
-            if !obj.contains_key("reasoning_effort") {
-                obj.insert("reasoning_effort".into(), json!(effort));
+/// Text the engine uses when a model cannot see images; the caller is told, not failed.
+pub const IMAGE_OMITTED: &str = "[image omitted: this model cannot see images. Tell the person in one sentence and suggest switching to a model that can.]";
+
+fn strip_images(obj: &mut Map<String, Value>, note: &str) -> bool {
+    let Some(messages) = obj.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for message in messages.iter_mut() {
+        let Some(content) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for part in content.iter_mut() {
+            let kind = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(kind, "image_url" | "image" | "input_image") {
+                *part = json!({"type": "text", "text": note});
+                changed = true;
             }
         }
-        if cfg.max_tokens_floor > 0 {
-            if let Some(current) = obj.get("max_tokens").and_then(|v| v.as_u64()) {
-                if current < cfg.max_tokens_floor {
-                    obj.insert("max_tokens".into(), json!(cfg.max_tokens_floor));
+    }
+    changed
+}
+
+pub fn rewrite_request(body: &Value, cfg: &Config, real: &str, cap: &Capability) -> Value {
+    let mut out = body.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    obj.insert("model".into(), json!(real));
+    let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if stream && cfg.always_include_usage {
+        let mut options = obj
+            .get("stream_options")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        options.insert("include_usage".into(), json!(true));
+        obj.insert("stream_options".into(), Value::Object(options));
+    }
+    // Effort: keep the caller's value when the model accepts it, otherwise substitute one it does.
+    let requested = obj
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match cap.effort(requested.as_deref(), cfg.reasoning_effort.as_deref()) {
+        Some(effort) => {
+            if let Some(from) = requested.as_deref() {
+                if Effort::parse(from) != Some(effort) {
+                    tracing::info!(model = real, from, to = effort.as_str(), "effort substituted");
                 }
             }
+            obj.insert("reasoning_effort".into(), json!(effort.as_str()));
         }
+        None => {
+            obj.remove("reasoning_effort");
+        }
+    }
+    // Output tokens: one field, never above the model's cap.
+    let requested_max = obj
+        .get("max_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| obj.get("max_completion_tokens").and_then(|v| v.as_i64()));
+    obj.remove("max_completion_tokens");
+    if let Some(max) = requested_max {
+        obj.insert("max_tokens".into(), json!(cap.clamp_output(max)));
+    } else if cfg.max_tokens_floor > 0 {
+        obj.insert(
+            "max_tokens".into(),
+            json!(cap.clamp_output(cfg.max_tokens_floor as i64)),
+        );
+    }
+    // Vision: a text-only model is told an image was omitted, instead of rejecting the request.
+    if !cap.vision && strip_images(obj, IMAGE_OMITTED) {
+        tracing::info!(model = real, "image parts omitted for a text-only model");
+    }
+    // Tools the model cannot use are not sent.
+    if !cap.tools {
+        obj.remove("tools");
+        obj.remove("tool_choice");
+        obj.remove("parallel_tool_calls");
+    } else if !cap.parallel_tools {
+        obj.remove("parallel_tool_calls");
     }
     out
 }
@@ -201,4 +258,74 @@ pub fn error_payload(status: u16, message: &str, code: &str) -> Value {
             "code": code
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::Capability;
+    use crate::config::{CapabilityOverride, Config};
+
+    fn cap(real: &str) -> Capability {
+        Capability::resolve(real, None, &Config::default())
+    }
+
+    #[test]
+    fn effort_is_substituted_when_the_model_rejects_it() {
+        let mut cfg = Config::default();
+        cfg.reasoning_effort = None;
+        let body = json!({"model": "x", "reasoning_effort": "max", "messages": []});
+        let out = rewrite_request(&body, &cfg, "glm-5.3", &cap("glm-5.3"));
+        assert_eq!(out["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn accepted_effort_is_kept() {
+        let mut cfg = Config::default();
+        cfg.reasoning_effort = None;
+        let body = json!({"model": "x", "reasoning_effort": "max", "messages": []});
+        let out = rewrite_request(&body, &cfg, "pixis-opus", &cap("pixis-opus"));
+        assert_eq!(out["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn output_tokens_are_unified_and_clamped() {
+        let cfg = Config::default();
+        let body = json!({"model": "x", "max_completion_tokens": 100000, "messages": []});
+        let out = rewrite_request(&body, &cfg, "glm-5.3", &cap("glm-5.3"));
+        assert_eq!(out["max_tokens"], 32_768);
+        assert!(out.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn images_are_replaced_for_text_only_models() {
+        let cfg = Config::default();
+        let body = json!({"model": "x", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+        ]}]});
+        let out = rewrite_request(&body, &cfg, "glm-5.3", &cap("glm-5.3"));
+        let parts = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "text");
+        assert!(parts[1]["text"].as_str().unwrap().contains("cannot see images"));
+    }
+
+    #[test]
+    fn tools_are_removed_when_the_model_has_none() {
+        let mut cfg = Config::default();
+        cfg.capabilities.insert(
+            "no-tools".into(),
+            CapabilityOverride {
+                tools: Some(false),
+                ..Default::default()
+            },
+        );
+        let cap = Capability::resolve("no-tools", None, &cfg);
+        let body = json!({"model": "x", "messages": [], "tools": [{"type": "function"}],
+                          "tool_choice": "auto", "parallel_tool_calls": true});
+        let out = rewrite_request(&body, &cfg, "no-tools", &cap);
+        assert!(out.get("tools").is_none());
+        assert!(out.get("tool_choice").is_none());
+        assert!(out.get("parallel_tool_calls").is_none());
+    }
 }

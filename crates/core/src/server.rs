@@ -225,7 +225,9 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
         Err(message) => return json_response(StatusCode::NOT_FOUND, error_payload(404, &message, "model_not_found")),
     };
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let upstream_body = rewrite_request(&body, &state.config, &resolved.real);
+    let limits = state.pool.limits_for(&resolved.real).await;
+    let capability = crate::capability::Capability::resolve(&resolved.real, limits.as_ref(), &state.config);
+    let upstream_body = rewrite_request(&body, &state.config, &resolved.real, &capability);
     let effort = effort_of(&upstream_body);
 
     // A request may span two runs: when a run's budget is spent the gateway answers

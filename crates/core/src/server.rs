@@ -284,18 +284,29 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
                 return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "run_token"));
             }
         };
-        resp = match state.client.chat(&entry.gateway, &upstream_body, &entry.token, stream).await {
-            Ok(resp) => resp,
-            Err(error) => {
-                record(&state, RecordArgs {
-                    model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
-                    ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
-                    ctx: None, error: Some(error.to_string()),
-                    bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "upstream_unreachable") }),
-                });
-                return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "upstream_unreachable"));
+        let mut attempt: u32 = 0;
+        loop {
+            match state.client.chat(&entry.gateway, &upstream_body, &entry.token, stream).await {
+                Ok(response) => {
+                    resp = response;
+                    break;
+                }
+                Err(error) => {
+                    attempt += 1;
+                    if attempt >= 3 {
+                        record(&state, RecordArgs {
+                            model: &resolved.alias, real_model: &resolved.real, stream, status: 502,
+                            ms: started.elapsed().as_millis() as i64, effort, first_token_ms: None,
+                            ctx: None, error: Some(error.to_string()),
+                            bodies: Some(BodyPair { request: upstream_body.clone(), response: error_payload(502, &error.to_string(), "upstream_unreachable") }),
+                        });
+                        return json_response(StatusCode::BAD_GATEWAY, error_payload(502, &error.to_string(), "upstream_unreachable"));
+                    }
+                    tracing::warn!("upstream send failed (attempt {}): {}; retrying", attempt, error);
+                    tokio::time::sleep(std::time::Duration::from_millis(1000 << (attempt - 1))).await;
+                }
             }
-        };
+        }
         let status = resp.status();
         if status != reqwest::StatusCode::UNAUTHORIZED
             && status != reqwest::StatusCode::PAYMENT_REQUIRED

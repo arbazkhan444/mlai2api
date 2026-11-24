@@ -185,9 +185,20 @@ fn try_append(path: &std::path::Path) -> bool {
 
 /// The first location this process can actually write to wins: the configured path,
 /// %LOCALAPPDATA%\mlai-bridge, ~/.mlai-bridge, %TEMP%\mlai-bridge, then the cwd.
+///
+/// An absolute configured path is used as-is. Testing it by opening the file made a
+/// transient lock (an exiting proxy, a second instance) silently move history and the
+/// limits cache into the working directory, so every launch could see a different cache.
 pub fn ensure_writable_file(preferred: &str, name: &str) -> String {
+    let preferred = preferred.trim();
+    if !preferred.is_empty() && std::path::Path::new(preferred).is_absolute() {
+        if let Some(parent) = std::path::Path::new(preferred).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return preferred.to_string();
+    }
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if !preferred.trim().is_empty() {
+    if !preferred.is_empty() {
         candidates.push(std::path::PathBuf::from(preferred));
     }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
@@ -230,4 +241,18 @@ pub fn new_api_key() -> String {
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut bytes);
     format!("mlba_{}", hex::encode(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_absolute_state_path_is_kept_as_configured() {
+        let dir = std::env::temp_dir().join("mlai-bridge-paths-test");
+        let path = dir.join("limits.cache.json");
+        let resolved = ensure_writable_file(&path.to_string_lossy(), "limits.cache.json");
+        assert_eq!(std::path::Path::new(&resolved), path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

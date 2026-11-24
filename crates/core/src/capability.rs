@@ -57,14 +57,16 @@ pub fn default_vision(real: &str) -> bool {
     !matches!(real, "glm-5.3" | "ml-ai-forge")
 }
 
-/// Context windows measured from the start response. A static fallback matters on the very
-/// first request for a model, before its run has been minted: judging a 400k prompt against
-/// the generic 200k default would refuse a model that actually accepts a million tokens.
-pub fn default_context(real: &str) -> i64 {
+/// Measured context windows for the models this bridge exposes. `None` means the model is
+/// unknown, so the value learned from its start response (or the generic default) applies.
+/// A known model's window wins over the stored cache: a stale or test-written entry must not
+/// shrink a million-token model to 200k.
+pub fn known_context(real: &str) -> Option<i64> {
     match real {
-        "pixis-opus" => 1_048_576,
-        "ml-ai-forge" => 110_000,
-        _ => DEFAULT_CONTEXT,
+        "pixis-opus" | "pixis-sol" => Some(1_048_576),
+        "ml-ai-forge" => Some(110_000),
+        "glm-5.3" | "kimi-k3" | "grok-4.7" | "gpt-6-astra" | "claude-sonnet-5.5" => Some(200_000),
+        _ => None,
     }
 }
 
@@ -87,9 +89,10 @@ impl Capability {
         let over: Option<&CapabilityOverride> = cfg.capabilities.get(real);
         let context = over
             .and_then(|o| o.context)
+            .or_else(|| known_context(real))
             .or_else(|| limits.map(|l| l.context))
             .filter(|value| *value > 0)
-            .unwrap_or_else(|| default_context(real));
+            .unwrap_or(DEFAULT_CONTEXT);
         let output = over
             .and_then(|o| o.output)
             .or_else(|| limits.and_then(|l| l.output))
@@ -161,6 +164,24 @@ mod tests {
     #[test]
     fn opus_has_a_million_token_window_before_any_run() {
         let cap = Capability::resolve("pixis-opus", None, &config());
+        assert_eq!(cap.context, 1_048_576);
+    }
+
+    #[test]
+    fn sol_also_has_a_million_token_window() {
+        let cap = Capability::resolve("pixis-sol", None, &config());
+        assert_eq!(cap.context, 1_048_576);
+    }
+
+    #[test]
+    fn a_stale_cache_does_not_shrink_a_known_model() {
+        let limits = Limits {
+            context: 200_000,
+            output: Some(32_768),
+            vision: true,
+            seen: String::new(),
+        };
+        let cap = Capability::resolve("pixis-sol", Some(&limits), &config());
         assert_eq!(cap.context, 1_048_576);
     }
 

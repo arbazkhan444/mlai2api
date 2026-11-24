@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/chat/completions", post(chat))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/responses", post(responses_chat))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -532,6 +533,128 @@ fn anthropic_stream(response: Response, openai: Value) -> Response {
     let input_tokens = crate::context::estimate_tokens(&openai);
     tokio::spawn(async move {
         let mut translator = crate::anthropic::Stream::new(&alias, input_tokens);
+        for event in translator.start() {
+            if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                return;
+            }
+        }
+        let mut buffer = String::new();
+        let mut usage: Option<Value> = None;
+        let mut upstream = response.into_body().into_data_stream();
+        while let Some(chunk) = upstream.next().await {
+            let Ok(bytes) = chunk else { break };
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            for payload in drain_frames(&mut buffer) {
+                let Ok(value) = serde_json::from_str::<Value>(&payload) else {
+                    continue;
+                };
+                if value.get("usage").map(|v| !v.is_null()).unwrap_or(false) {
+                    usage = Some(value["usage"].clone());
+                }
+                for event in translator.feed(&value) {
+                    if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        for event in translator.finish(usage.as_ref()) {
+            let _ = tx.send(Ok(Bytes::from(event))).await;
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream; charset=utf-8")
+        .header("Cache-Control", "no-cache, no-transform")
+        .header("Connection", "keep-alive")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
+}
+
+/// Responses in, the canonical OpenAI path underneath, Responses events out.
+async fn responses_chat(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !authorized(&state.config, &headers) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            error_payload(401, "Invalid bridge API key. Use the apiKey from config.json as the API key in your client.", "invalid_api_key"),
+        );
+    }
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                error_payload(400, "The request body must be a JSON object", "bad_request"),
+            )
+        }
+    };
+    let mut openai = crate::responses::to_openai(&parsed);
+    let stream = openai
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if stream {
+        // The translator needs the final usage to fill response.completed.
+        openai["stream_options"] = json!({"include_usage": true});
+    }
+    let encoded = match serde_json::to_vec(&openai) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                error_payload(400, "The request could not be encoded", "bad_request"),
+            )
+        }
+    };
+    let response = chat(State(state), headers, Bytes::from(encoded)).await;
+    if response.status() != StatusCode::OK {
+        // The canonical OpenAI error envelope is also valid for a Responses client.
+        return response;
+    }
+    if stream {
+        return responses_stream(response, openai);
+    }
+    let bytes = match axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                error_payload(502, "The reply could not be read", "invalid_response"),
+            )
+        }
+    };
+    let normalized: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                error_payload(502, "The reply could not be read", "invalid_response"),
+            )
+        }
+    };
+    let alias = normalized
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    json_response(
+        StatusCode::OK,
+        crate::responses::from_completion(&normalized, alias),
+    )
+}
+
+/// Reads the canonical OpenAI stream and re-emits it as Responses events.
+fn responses_stream(response: Response, openai: Value) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let alias = openai
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let created = chrono::Utc::now().timestamp();
+    tokio::spawn(async move {
+        let mut translator = crate::responses::Stream::new(&alias, created);
         for event in translator.start() {
             if tx.send(Ok(Bytes::from(event))).await.is_err() {
                 return;

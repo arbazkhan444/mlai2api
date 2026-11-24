@@ -6,6 +6,7 @@ pub mod capability;
 pub mod config;
 pub mod context;
 pub mod mlai;
+pub mod responses;
 pub mod server;
 pub mod store;
 pub mod transform;

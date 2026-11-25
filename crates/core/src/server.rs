@@ -749,6 +749,101 @@ fn merge_tool_call(acc: &mut Vec<Value>, delta: &Value) {
     }
 }
 
+/// What one upstream stream attempt produced.
+enum Pump {
+    /// The stream ran to a finish_reason; safe to deliver.
+    Complete {
+        frames: Vec<String>,
+        ctx: StreamCtx,
+        content: String,
+        reasoning: String,
+        tool_calls: Vec<Value>,
+        finish: String,
+        first_token_ms: Option<i64>,
+    },
+    /// The upstream died or closed without a finish_reason. A retry may succeed.
+    Killed(String),
+    /// The downstream client went away; nothing is delivered and nothing is retried.
+    Cancelled,
+}
+
+/// Consumes one upstream response fully, buffering normalized SSE frames without
+/// forwarding anything. Buffering is what makes a killed stream invisible: a fresh
+/// attempt can be swapped in before the client sees a single token. A full response
+/// is a few MB at worst.
+/// ponytail: uncapped buffer; if some model streams unbounded, cap frames like MAX_RAW_SSE.
+async fn pump(
+    resp: reqwest::Response,
+    alias: &str,
+    reasoning: crate::config::ReasoningMode,
+    want_usage: bool,
+    started: std::time::Instant,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) -> Pump {
+    let mut ctx = StreamCtx::new(alias, reasoning);
+    ctx.want_usage = want_usage;
+    let mut buffer = String::new();
+    let mut upstream = resp.bytes_stream();
+    let mut content = String::new();
+    let mut reasoning_text = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut finish: Option<String> = None;
+    let mut first_token_ms: Option<i64> = None;
+    let mut frames: Vec<String> = Vec::new();
+    while let Some(chunk) = upstream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if tx.is_closed() {
+                    return Pump::Cancelled;
+                }
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(index) = buffer.find("\n\n") {
+                    let frame: String = buffer[..index].to_string();
+                    buffer.drain(..index + 2);
+                    for line in frame.split('\n') {
+                        let line = line.trim();
+                        let Some(payload) = line.strip_prefix("data:") else { continue };
+                        let payload = payload.trim();
+                        if payload.is_empty() || payload == "[DONE]" {
+                            continue;
+                        }
+                        let Ok(value) = serde_json::from_str::<Value>(payload) else { continue };
+                        let Some(out) = normalize_chunk(&value, &mut ctx) else { continue };
+                        if let Some(choices) = out.get("choices").and_then(|c| c.as_array()) {
+                            for choice in choices {
+                                if let Some(delta) = choice.get("delta") {
+                                    let text = delta.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                                    let thought = delta.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
+                                    if first_token_ms.is_none() && (!text.is_empty() || !thought.is_empty()) {
+                                        first_token_ms = Some(started.elapsed().as_millis() as i64);
+                                    }
+                                    content.push_str(text);
+                                    reasoning_text.push_str(thought);
+                                    if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                        for call in calls {
+                                            merge_tool_call(&mut tool_calls, call);
+                                        }
+                                    }
+                                }
+                                if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                                    finish = Some(reason.to_string());
+                                }
+                            }
+                        }
+                        frames.push(format!("data: {}\n\n", out));
+                    }
+                }
+            }
+            Err(error) => return Pump::Killed(format!("error decoding response body: {error}")),
+        }
+    }
+    match finish {
+        // The upstream closed without a finish_reason: a killed stream, not a complete one.
+        Some(reason) => Pump::Complete { frames, ctx, content, reasoning: reasoning_text, tool_calls, finish: reason, first_token_ms },
+        None => Pump::Killed("stream closed without finish_reason".to_string()),
+    }
+}
+
 fn stream_out(
     state: AppState,
     resp: reqwest::Response,
@@ -762,102 +857,93 @@ fn stream_out(
     let alias = resolved.alias.clone();
     let real = resolved.real.clone();
     tokio::spawn(async move {
-        let mut ctx = StreamCtx::new(&alias, state.config.reasoning);
-        ctx.want_usage = want_usage;
-        let mut buffer = String::new();
-        let mut upstream = resp.bytes_stream();
-        let mut failed: Option<String> = None;
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut tool_calls: Vec<Value> = Vec::new();
-        let mut finish: Option<String> = None;
-        let mut raw = String::new();
-        let mut raw_truncated = false;
-        let mut first_token_ms: Option<i64> = None;
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    loop {
-                        let Some(index) = buffer.find("\n\n") else { break };
-                        let frame: String = buffer[..index].to_string();
-                        buffer.drain(..index + 2);
-                        for line in frame.split('\n') {
-                            let line = line.trim();
-                            let Some(payload) = line.strip_prefix("data:") else { continue };
-                            let payload = payload.trim();
-                            if payload.is_empty() || payload == "[DONE]" {
-                                continue;
-                            }
-                            let Ok(value) = serde_json::from_str::<Value>(payload) else { continue };
-                            let Some(out) = normalize_chunk(&value, &mut ctx) else { continue };
-                            if let Some(choices) = out.get("choices").and_then(|c| c.as_array()) {
-                                for choice in choices {
-                                    if let Some(delta) = choice.get("delta") {
-                                        let text = delta.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                                        let thought = delta.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
-                                        if first_token_ms.is_none() && (!text.is_empty() || !thought.is_empty()) {
-                                            first_token_ms = Some(started.elapsed().as_millis() as i64);
-                                        }
-                                        content.push_str(text);
-                                        reasoning.push_str(thought);
-                                        if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                                            for call in calls {
-                                                merge_tool_call(&mut tool_calls, call);
-                                            }
-                                        }
-                                    }
-                                    if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                                        finish = Some(reason.to_string());
-                                    }
-                                }
-                            }
-                            if raw.len() < MAX_RAW_SSE {
-                                raw.push_str(&format!("data: {}\n\n", out));
-                            } else {
-                                raw_truncated = true;
-                            }
-                            let frame = format!("data: {}\n\n", out);
-                            if tx.send(Ok(Bytes::from(frame))).await.is_err() {
-                                return;
-                            }
+        // The gateway kills long streams at ~168s (tool-call turns with deep reasoning
+        // are the slow ones). A kill must not reach the coding agent — it ends the run.
+        // Each attempt is buffered; on a kill the whole request is re-run invisibly and
+        // only a complete attempt is delivered.
+        let mut first_resp = Some(resp);
+        let mut attempt: u32 = 0;
+        let mut failure: Option<String> = None;
+        loop {
+            attempt += 1;
+            let resp = match first_resp.take() {
+                Some(resp) => resp,
+                None => {
+                    let entry = match state.pool.ensure(&real).await {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            failure = Some(format!("re-run could not mint a fresh run: {error}"));
+                            break;
+                        }
+                    };
+                    match state.client.chat(&entry.gateway, &request_body, &entry.token, true).await {
+                        Ok(resp) => resp,
+                        Err(error) => {
+                            failure = Some(error.to_string());
+                            break;
                         }
                     }
                 }
-                Err(error) => {
-                    failed = Some(error.to_string());
-                    let payload = json!({"error": {"message": format!("The model stream ended early: {}", error), "type": "upstream_error", "code": "stream_interrupted"}});
-                    let frame = format!("data: {}\n\n", payload);
-                    let _ = tx.send(Ok(Bytes::from(frame))).await;
-                    break;
+            };
+            match pump(resp, &alias, state.config.reasoning, want_usage, started, &tx).await {
+                Pump::Complete { frames, ctx, content, reasoning, tool_calls, finish, first_token_ms } => {
+                    for frame in frames {
+                        if tx.send(Ok(Bytes::from(frame))).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
+                    let detail = json!({
+                        "stream": true,
+                        "assembled": true,
+                        "content": content,
+                        "reasoning": reasoning,
+                        "toolCalls": tool_calls,
+                        "finishReason": finish,
+                        "usage": ctx.usage,
+                        "chunks": ctx.chunks,
+                        "attempts": attempt,
+                    });
+                    record(&state, RecordArgs {
+                        model: &alias,
+                        real_model: &real,
+                        stream: true,
+                        status: 200,
+                        ms: started.elapsed().as_millis() as i64,
+                        effort,
+                        first_token_ms,
+                        ctx: Some(&ctx),
+                        error: None,
+                        bodies: Some(BodyPair { request: request_body, response: detail }),
+                    });
+                    return;
+                }
+                Pump::Cancelled => return,
+                Pump::Killed(error) => {
+                    record(&state, RecordArgs {
+                        model: &alias,
+                        real_model: &real,
+                        stream: true,
+                        status: 502,
+                        ms: started.elapsed().as_millis() as i64,
+                        effort: effort.clone(),
+                        first_token_ms: None,
+                        ctx: None,
+                        error: Some(format!("{error} (attempt {attempt})")),
+                        bodies: Some(BodyPair { request: request_body.clone(), response: json!({"error": error}) }),
+                    });
+                    if attempt >= 3 || tx.is_closed() {
+                        failure = Some(error);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         }
+        let error = failure.unwrap_or_else(|| "stream failed".to_string());
+        let payload = json!({"error": {"message": format!("The model stream ended early: {error}"), "type": "upstream_error", "code": "stream_interrupted"}});
+        let _ = tx.send(Ok(Bytes::from(format!("data: {payload}\n\n")))).await;
         let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
-        let detail = json!({
-            "stream": true,
-            "assembled": true,
-            "content": content,
-            "reasoning": reasoning,
-            "toolCalls": tool_calls,
-            "finishReason": finish,
-            "usage": ctx.usage,
-            "chunks": ctx.chunks,
-            "rawSse": raw,
-            "rawTruncated": raw_truncated,
-        });
-        record(&state, RecordArgs {
-            model: &alias,
-            real_model: &real,
-            stream: true,
-            status: if failed.is_some() { 502 } else { 200 },
-            ms: started.elapsed().as_millis() as i64,
-            effort,
-            first_token_ms,
-            ctx: Some(&ctx),
-            error: failed,
-            bodies: Some(BodyPair { request: request_body, response: detail }),
-        });
     });
 
     Response::builder()
@@ -868,4 +954,57 @@ fn stream_out(
         .header("X-Accel-Buffering", "no")
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sse_response(chunks: Vec<Result<Bytes, std::io::Error>>) -> reqwest::Response {
+        let stream = futures_util::stream::iter(chunks);
+        let body = reqwest::Body::wrap_stream(stream);
+        reqwest::Response::from(axum::http::Response::new(body))
+    }
+
+    #[tokio::test]
+    async fn pump_reports_a_killed_stream_as_retryable() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let resp = sse_response(vec![
+            Ok(Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n")),
+            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer")),
+        ]);
+        assert!(matches!(
+            pump(resp, "m", Default::default(), false, std::time::Instant::now(), &tx).await,
+            Pump::Killed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pump_reports_a_stream_that_closes_without_finish_as_killed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let resp = sse_response(vec![
+            Ok(Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")),
+        ]);
+        assert!(matches!(
+            pump(resp, "m", Default::default(), false, std::time::Instant::now(), &tx).await,
+            Pump::Killed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pump_collects_frames_from_a_complete_stream() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let resp = sse_response(vec![Ok(Bytes::from(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        )))]);
+        match pump(resp, "m", Default::default(), false, std::time::Instant::now(), &tx).await {
+            Pump::Complete { frames, finish, content, .. } => {
+                assert_eq!(frames.len(), 2);
+                assert_eq!(finish, "stop");
+                assert_eq!(content, "ok");
+            }
+            _ => panic!("expected Complete"),
+        }
+    }
 }
